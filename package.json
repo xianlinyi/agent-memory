@@ -1,0 +1,44 @@
+{
+  "name": "@agent-memory/knowledge-graph",
+  "version": "0.1.0",
+  "description": "External agent memory layer backed by Obsidian Markdown and SQLite FTS5.",
+  "type": "module",
+  "bin": {
+    "agent-memory": "./dist/src/cli/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist/src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": [
+    "agent",
+    "memory",
+    "knowledge-graph",
+    "obsidian",
+    "sqlite",
+    "fts5"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@github/copilot-sdk": "^0.2.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.0"
+  }
+}
