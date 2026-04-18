@@ -20,6 +20,8 @@ test("cli init and doctor produce machine-readable output", async () => {
     assert.equal(initJson.configPath, join(vaultPath, ".kg", "config.json"));
     await access(join(vaultPath, ".kg", "graph.db"));
     await access(join(vaultPath, ".kg", "config.json"));
+    const persisted = JSON.parse(await readFile(join(vaultPath, ".kg", "config.json"), "utf8")) as { model: { model: string } };
+    assert.equal(persisted.model.model, "gpt-5-mini");
 
     const doctor = await execFileAsync(process.execPath, [cliPath, "doctor", "--vault", vaultPath, "--json"]);
     const checks = JSON.parse(doctor.stdout) as Array<{ name: string; ok: boolean }>;
@@ -113,11 +115,11 @@ if (input.includes("Extract durable agent memory")) {
     ]);
     const compactJson = JSON.parse(compact.stdout) as {
       query?: unknown;
-      searchTerms: string[];
       assumptions: string[];
       relationships: Array<{ source?: string; predicate: string; target?: string; description: string }>;
-      evidence: Array<{ kind: string; title: string; content: string }>;
-      matchCount: number;
+      searchTerms?: unknown;
+      evidence?: unknown;
+      matchCount?: unknown;
       answer?: string;
       matches?: unknown;
       interpretation?: unknown;
@@ -126,20 +128,18 @@ if (input.includes("Extract durable agent memory")) {
     };
     assert.equal(compactJson.answer, undefined);
     assert.equal(compactJson.query, undefined);
-    assert.ok(compactJson.searchTerms.includes("etr"));
     assert.ok(compactJson.assumptions.includes("etr represents_table_contents cashir.temporary_receipt"));
     assert.ok(compactJson.relationships.some((item) => item.predicate === "represents_table_contents"));
     assert.ok(compactJson.relationships.some((item) => item.source === "etr" && item.target === "cashir.temporary_receipt"));
     assert.equal(compactJson.relationships.filter((item) => item.source === "etr" && item.predicate === "represents_table_contents" && item.target === "cashir.temporary_receipt").length, 1);
-    assert.ok(compactJson.evidence.some((item) => item.title === "etr"));
-    assert.equal(compactJson.evidence.filter((item) => item.kind === "entity" && item.title === "etr").length, 1);
-    assert.ok(compactJson.evidence.length <= 5);
-    assert.equal(typeof compactJson.matchCount, "number");
+    assert.deepEqual(Object.keys(compactJson).sort(), ["assumptions", "relationships"]);
+    assert.equal(compactJson.searchTerms, undefined);
+    assert.equal(compactJson.evidence, undefined);
+    assert.equal(compactJson.matchCount, undefined);
     assert.equal(compactJson.matches, undefined);
     assert.equal(compactJson.interpretation, undefined);
     assert.equal(compactJson.interpretedQuery, undefined);
     assert.equal(compactJson.traversal, undefined);
-    assert.ok(compactJson.evidence.every((item) => !("id" in item) && !("score" in item) && !("metadata" in item)));
 
     const detailed = await execFileAsync(process.execPath, [
       cliPath,

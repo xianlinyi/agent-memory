@@ -14,9 +14,20 @@ interface ParsedArgs {
   flags: Map<string, string | boolean>;
 }
 
-const COMPACT_EVIDENCE_LIMIT = 5;
 const COMPACT_RELATIONSHIP_LIMIT = 8;
-const SPINNER_FRAMES = ["-", "\\", "|", "/"];
+const SPINNER_FRAMES = [
+  "\x1b[34m⠋\x1b[0m",
+  "\x1b[34m⠙\x1b[0m",
+  "\x1b[34m⠹\x1b[0m",
+  "\x1b[34m⠸\x1b[0m",
+  "\x1b[34m⠼\x1b[0m",
+  "\x1b[34m⠴\x1b[0m",
+  "\x1b[34m⠦\x1b[0m",
+  "\x1b[34m⠧\x1b[0m",
+  "\x1b[34m⠇\x1b[0m",
+  "\x1b[34m⠏\x1b[0m"
+];
+const NO_COLOR_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 async function main(): Promise<void> {
   process.env.NODE_OPTIONS = appendNodeOption(process.env.NODE_OPTIONS, "--disable-warning=ExperimentalWarning");
@@ -137,9 +148,8 @@ async function handleQuery(engine: MemoryEngine, parsed: ParsedArgs, logger: Log
       text,
       limit: numberFlag(parsed, "limit") ?? 10,
       maxHops: numberFlag(parsed, "max-hops"),
-      synthesize: !parsed.flags.has("json") || parsed.flags.has("answer"),
+      synthesize: !parsed.flags.has("json") || (parsed.flags.has("details") && parsed.flags.has("answer")),
       onProgress: async (event) => {
-        spinner.update(formatQueryProgressStatus(event));
         await logger.debug(formatQueryProgress(event));
       }
     })
@@ -310,22 +320,29 @@ function printJsonOrText(parsed: ParsedArgs, value: unknown, text?: string): voi
   }
 }
 
+async function withSpinner<T>(parsed: ParsedArgs, message: string, operation: () => Promise<T>): Promise<T> {
+  return createSpinner(parsed, message).run(operation);
+}
+
 interface CliSpinner {
-  update(message: string): void;
   run<T>(operation: () => Promise<T>): Promise<T>;
 }
 
 function createSpinner(parsed: ParsedArgs, initialMessage: string): CliSpinner {
   const enabled = Boolean(process.stderr.isTTY) && !parsed.flags.has("verbose");
-  let message = initialMessage;
+  const frames = process.env.NO_COLOR ? NO_COLOR_SPINNER_FRAMES : SPINNER_FRAMES;
   let frameIndex = 0;
   let timer: NodeJS.Timeout | undefined;
   let lastLength = 0;
+  let cursorHidden = false;
+  const startedAt = Date.now();
 
   const render = () => {
     if (!enabled) return;
-    const line = `${SPINNER_FRAMES[frameIndex]} ${message}`;
-    frameIndex = (frameIndex + 1) % SPINNER_FRAMES.length;
+    const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
+    const elapsedText = process.env.NO_COLOR ? `${elapsedSeconds}s` : `\x1b[90m${elapsedSeconds}s\x1b[0m`;
+    const line = `${frames[frameIndex]} ${initialMessage} ${elapsedText}`;
+    frameIndex = (frameIndex + 1) % frames.length;
     lastLength = Math.max(lastLength, line.length);
     process.stderr.write(`\r${line}${" ".repeat(Math.max(0, lastLength - line.length))}`);
   };
@@ -337,18 +354,20 @@ function createSpinner(parsed: ParsedArgs, initialMessage: string): CliSpinner {
       timer = undefined;
     }
     process.stderr.write(`\r${" ".repeat(lastLength)}\r`);
+    if (cursorHidden) {
+      process.stderr.write("\x1b[?25h");
+      cursorHidden = false;
+    }
     lastLength = 0;
   };
 
   return {
-    update(nextMessage: string): void {
-      message = nextMessage;
-      render();
-    },
     async run<T>(operation: () => Promise<T>): Promise<T> {
       if (enabled) {
+        process.stderr.write("\x1b[?25l");
+        cursorHidden = true;
         render();
-        timer = setInterval(render, 100);
+        timer = setInterval(render, 80);
       }
       try {
         return await operation();
@@ -357,10 +376,6 @@ function createSpinner(parsed: ParsedArgs, initialMessage: string): CliSpinner {
       }
     }
   };
-}
-
-async function withSpinner<T>(parsed: ParsedArgs, message: string, operation: () => Promise<T>): Promise<T> {
-  return createSpinner(parsed, message).run(operation);
 }
 
 function printQueryResult(parsed: ParsedArgs, result: Awaited<ReturnType<MemoryEngine["query"]>>): void {
@@ -390,33 +405,16 @@ function printQueryResult(parsed: ParsedArgs, result: Awaited<ReturnType<MemoryE
 }
 
 interface CompactQueryResult {
-  searchTerms: string[];
   assumptions: string[];
   relationships: Array<{ source?: string; predicate: string; target?: string; description: string }>;
-  evidence: Array<{ kind: MemoryMatch["kind"]; title: string; content: string }>;
-  matchCount: number;
-  answer?: string;
 }
 
 function compactQueryResult(result: QueryResult, graph?: GraphSnapshot): CompactQueryResult {
   const relationships = compactRelationships(result.matches, graph);
-  const compact: CompactQueryResult = {
-    searchTerms: compactSearchTerms(result),
+  return {
     assumptions: compactAssumptions(relationships),
-    relationships,
-    evidence: compactEvidence(result.matches),
-    matchCount: result.matches.length
+    relationships
   };
-  if (result.answer.trim()) compact.answer = result.answer.trim();
-  return compact;
-}
-
-function compactSearchTerms(result: QueryResult): string[] {
-  return uniqueStrings([
-    ...result.interpretation.entities,
-    ...result.interpretation.keywords,
-    ...result.interpretation.predicates
-  ]).slice(0, 8);
 }
 
 function compactAssumptions(relationships: Array<{ source?: string; predicate: string; target?: string; description: string }>): string[] {
@@ -509,42 +507,6 @@ function compactRelationship(
   };
 }
 
-function compactEvidence(matches: MemoryMatch[]): Array<{ kind: MemoryMatch["kind"]; title: string; content: string }> {
-  const seen = new Set<string>();
-  const evidence: Array<{ kind: MemoryMatch["kind"]; title: string; content: string }> = [];
-  for (const match of matches) {
-    if (evidence.length >= COMPACT_EVIDENCE_LIMIT) break;
-    const item = {
-      kind: match.kind,
-      title: match.title,
-      content: compactMatchText(match)
-    };
-    if (!item.content) continue;
-    const key = evidenceKey(item);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    evidence.push(item);
-  }
-  return evidence;
-}
-
-function evidenceKey(item: { kind: MemoryMatch["kind"]; title: string; content: string }): string {
-  if (item.kind === "entity") return `${item.kind}\u0000${canonicalText(item.title)}`;
-  return `${item.kind}\u0000${canonicalText(item.content)}`;
-}
-
-function uniqueStrings(values: string[]): string[] {
-  const seen = new Set<string>();
-  const unique: string[] = [];
-  for (const value of values.map(cleanCompactText).filter(Boolean)) {
-    const key = canonicalText(value);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(value);
-  }
-  return unique;
-}
-
 function compactMatchText(match: MemoryMatch): string {
   const lines = match.text
     .split(/\r?\n/)
@@ -574,37 +536,6 @@ function canonicalText(value: string): string {
 function formatQueryProgress(event: QueryProgressEvent): string {
   const detailText = event.details ? ` ${formatLogDetails(event.details)}` : "";
   return `query stage=${event.stage} durationMs=${event.durationMs} totalMs=${event.totalMs}${detailText}`;
-}
-
-function formatQueryProgressStatus(event: QueryProgressEvent): string {
-  switch (event.stage) {
-    case "ensureReady":
-      return "Preparing memory engine";
-    case "prepare":
-      return "Preparing query";
-    case "model.extractQuery":
-      return "Interpreting query";
-    case "graph.search":
-      return "Searching memory graph";
-    case "graph.expand.model.candidates":
-    case "model.decideQueryHop":
-    case "graph.expandNodes":
-    case "graph.expand.model.complete":
-      return "Expanding related memories";
-    case "graph.expand.entities":
-      return "Collecting related entities";
-    case "graph.expand.skipped":
-    case "graph.expand.model.skipped":
-      return "Using direct memory matches";
-    case "model.synthesizeAnswer":
-      return "Synthesizing answer";
-    case "model.synthesizeAnswer.skipped":
-      return "Preparing results";
-    case "query.complete":
-      return "Finishing query";
-    default:
-      return `Working: ${event.stage}`;
-  }
 }
 
 function formatLogDetails(details: Record<string, unknown>): string {
@@ -755,8 +686,8 @@ Global flags:
   --log-file <path>         Append progress logs to a file.
 
 Query output:
-  --json                    Print compact agent-friendly relationships and evidence.
-  --answer                  Include a synthesized answer in query JSON.
+  --json                    Print compact assumptions and relationships.
+  --answer                  Include a synthesized answer only with --json --details.
   --details                 Include query interpretation and full matches in text mode, or full JSON with --json.
 `);
 }

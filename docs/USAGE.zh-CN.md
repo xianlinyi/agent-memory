@@ -221,11 +221,11 @@ agent-memory query "Atlas memory" --vault ./memory-vault --limit 5 --max-hops 1
 - `--max-hops n`: 图谱扩展跳数，默认 `2`，最大 `3`，设为 `0` 时只用直接搜索结果。
 - `--details`: 文本模式显示查询解释和完整匹配；JSON 模式返回完整 `QueryResult`。
 - `--json`: 返回 compact JSON。
-- `--answer`: 在 compact JSON 中额外包含合成答案。
+- `--answer`: 与 `--json --details` 一起使用时，在完整 JSON 中包含合成答案。
 
 ## Compact JSON 输出
 
-默认 `query --json` 返回面向 agent 和脚本的紧凑结构，不包含原问题、不包含完整内部 matches：
+默认 `query --json` 返回面向 agent 和脚本的紧凑结构，只保留 assumptions 和 relationships：
 
 ```bash
 agent-memory query "Atlas memory" --vault ./memory-vault --json
@@ -235,7 +235,6 @@ agent-memory query "Atlas memory" --vault ./memory-vault --json
 
 ```json
 {
-  "searchTerms": ["Atlas", "memory", "stores"],
   "assumptions": ["Project Atlas uses Obsidian"],
   "relationships": [
     {
@@ -244,26 +243,14 @@ agent-memory query "Atlas memory" --vault ./memory-vault --json
       "target": "Obsidian",
       "description": "Project Atlas uses Obsidian for local-first memory."
     }
-  ],
-  "evidence": [
-    {
-      "kind": "entity",
-      "title": "Project Atlas",
-      "content": "Uses Obsidian for local-first memory."
-    }
-  ],
-  "matchCount": 3
+  ]
 }
 ```
 
 字段说明：
 
-- `searchTerms`: 模型解释查询后提取出的实体、关键词和谓词，去重后最多 8 个。
 - `assumptions`: 从关系中压缩出来的可继续推理事实，最多 5 条。
 - `relationships`: 与查询相关的去重关系，最多 8 条。
-- `evidence`: 去重后的证据摘要，最多 5 条。
-- `matchCount`: 原始匹配数量。
-- `answer`: 仅在请求了 `--answer` 且有合成答案时出现。
 
 如果需要完整调试信息：
 
@@ -402,7 +389,7 @@ memory-vault/.kg/config.json
   "databasePath": "/absolute/path/to/memory-vault/.kg/graph.db",
   "model": {
     "provider": "copilot-sdk",
-    "model": "gpt-5",
+    "model": "gpt-5-mini",
     "timeoutMs": 30000
   }
 }
@@ -412,7 +399,7 @@ memory-vault/.kg/config.json
 
 ```bash
 agent-memory config get model --vault ./memory-vault --json
-agent-memory config set model.model gpt-5 --vault ./memory-vault
+agent-memory config set model.model gpt-5-mini --vault ./memory-vault
 agent-memory config set model.reasoningEffort medium --vault ./memory-vault
 agent-memory config set model.timeoutMs 30000 --vault ./memory-vault
 agent-memory config unset model.reasoningEffort --vault ./memory-vault

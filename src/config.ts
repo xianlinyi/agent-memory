@@ -20,7 +20,7 @@ export function defaultConfig(vaultPath: string): AgentMemoryConfig {
     databasePath: join(resolvedVault, INTERNAL_DIR, DATABASE_FILE),
     model: {
       provider: "copilot-sdk",
-      model: "gpt-5",
+      model: "gpt-5-mini",
       timeoutMs: 30000
     }
   };

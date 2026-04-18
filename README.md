@@ -84,11 +84,10 @@ Interactive commands show a spinner while waiting. Structured output is written 
 
 ## Query JSON
 
-Default `query --json` returns a compact, agent-friendly result. It intentionally omits the original question and full internal matches:
+Default `query --json` returns a compact, agent-friendly result. It intentionally returns only assumptions and relationships:
 
 ```json
 {
-  "searchTerms": ["Atlas", "memory", "stores"],
   "assumptions": ["Project Atlas uses Obsidian"],
   "relationships": [
     {
@@ -97,19 +96,11 @@ Default `query --json` returns a compact, agent-friendly result. It intentionall
       "target": "Obsidian",
       "description": "Project Atlas uses Obsidian for local-first agent memory."
     }
-  ],
-  "evidence": [
-    {
-      "kind": "entity",
-      "title": "Project Atlas",
-      "content": "Uses Obsidian for local-first agent memory."
-    }
-  ],
-  "matchCount": 3
+  ]
 }
 ```
 
-Use `--answer` with `--json` to include a synthesized natural-language answer. Use `--details` with `--json` to return the full `QueryResult`, including `query`, `interpretation`, `matches`, `answer`, and optional traversal details.
+Use `--details` with `--json` to return the full `QueryResult`, including `query`, `interpretation`, `matches`, `answer`, and optional traversal details. Use `--answer` together with `--json --details` when the detailed JSON should include a synthesized natural-language answer.
 
 ## Script Usage
 
@@ -181,7 +172,7 @@ Vault configuration lives in `.kg/config.json`:
   "databasePath": "/absolute/path/to/memory-vault/.kg/graph.db",
   "model": {
     "provider": "copilot-sdk",
-    "model": "gpt-5",
+    "model": "gpt-5-mini",
     "reasoningEffort": "medium",
     "timeoutMs": 30000
   }
@@ -191,7 +182,7 @@ Vault configuration lives in `.kg/config.json`:
 Update it through the CLI:
 
 ```bash
-agent-memory config set model.model gpt-5 --vault ./memory-vault
+agent-memory config set model.model gpt-5-mini --vault ./memory-vault
 agent-memory config set model.reasoningEffort medium --vault ./memory-vault
 agent-memory config set model.timeoutMs 30000 --vault ./memory-vault
 agent-memory config get model --vault ./memory-vault --json
