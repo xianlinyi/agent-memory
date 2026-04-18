@@ -1,5 +1,8 @@
 export { MemoryEngine, createDefaultEngine, textOrFile } from "./core/memory-engine.js";
 export type { MemoryEngineOptions } from "./core/memory-engine.js";
+export { MemoryEngineExecutor } from "./core/engine-executor.js";
+export type { MemoryEngineExecutorOptions } from "./core/engine-executor.js";
+export { createModelProvider } from "./model/model-factory.js";
 export { CopilotSdkModelProvider } from "./model/copilot-sdk-provider.js";
 export type { CopilotSdkModelProviderOptions } from "./model/copilot-sdk-provider.js";
 export { CopilotCliModelProvider } from "./model/copilot-cli-provider.js";

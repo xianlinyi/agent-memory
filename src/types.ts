@@ -112,6 +112,13 @@ export interface QueryResult {
   traversal?: QueryTraversalStep[];
 }
 
+export interface QueryProgressEvent {
+  stage: string;
+  durationMs: number;
+  totalMs: number;
+  details?: Record<string, unknown>;
+}
+
 export interface GraphSnapshot {
   entities: Entity[];
   relations: Relation[];
@@ -169,4 +176,5 @@ export interface QueryInput {
   limit?: number;
   maxHops?: number;
   synthesize?: boolean;
+  onProgress?: (event: QueryProgressEvent) => void | Promise<void>;
 }

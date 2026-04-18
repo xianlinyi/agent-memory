@@ -1,8 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { defaultConfig, loadConfig, writeConfig } from "../config.js";
-import { CopilotCliModelProvider } from "../model/copilot-cli-provider.js";
-import { CopilotSdkModelProvider } from "../model/copilot-sdk-provider.js";
+import { normalizeExtraction } from "../model/extraction.js";
+import { createModelProvider } from "../model/model-factory.js";
 import type { ModelProvider } from "../model/model-provider.js";
 import type { GraphStore } from "../store/graph-store.js";
 import { NodeSqliteFtsGraphStore } from "../store/node-sqlite-fts-store.js";
@@ -18,12 +18,14 @@ import type {
   MemoryStatus,
   QueryHopCandidate,
   QueryInput,
+  QueryProgressEvent,
   QueryResult,
   QueryTraversalStep,
   Relation,
   SourceRef
 } from "../types.js";
 import { stableId } from "../utils/ids.js";
+import { importNodeSqlite } from "../utils/node-sqlite.js";
 import { nowIso } from "../utils/time.js";
 import { ObsidianVaultStore, type VaultStore } from "../vault/vault-store.js";
 
@@ -86,7 +88,7 @@ export class MemoryEngine {
   async ingest(input: IngestInput): Promise<{ source?: SourceRef; episode: Episode; entities: Entity[]; relations: Relation[] }> {
     await this.ensureReady();
     const timestamp = nowIso();
-    const extracted = await this.modelProvider.extractMemory({ text: input.text });
+    const extracted = normalizeExtraction(await this.modelProvider.extractMemory({ text: input.text }));
     const source = input.source
       ? await this.createSource({
           id: stableId("source", [input.source.kind ?? "cli", input.source.label, input.source.uri, input.text]),
@@ -164,30 +166,58 @@ export class MemoryEngine {
   }
 
   async query(input: QueryInput): Promise<QueryResult> {
+    const trace = createQueryTracer(input.onProgress);
     await this.ensureReady();
+    await trace("ensureReady");
     const limit = input.limit ?? 10;
     const maxHops = normalizeMaxHops(input.maxHops);
+    await trace("prepare", { limit, maxHops });
     const interpretation = await this.modelProvider.extractQuery({ text: input.text });
+    await trace("model.extractQuery", {
+      keywords: interpretation.keywords.length,
+      entities: interpretation.entities.length,
+      predicates: interpretation.predicates.length
+    });
     const directMatches = await this.graphStore.search(interpretation.expandedQuery, limit);
+    await trace("graph.search", { matches: directMatches.length });
     let traversal: QueryTraversalStep[] | undefined;
     let matches: MemoryMatch[];
     if (maxHops === 0) {
       matches = directMatches;
-    } else if (this.modelProvider.decideQueryHop) {
-      const expanded = await this.expandMatchesWithModel(input.text, interpretation, directMatches, limit, maxHops);
+      await trace("graph.expand.skipped", { reason: "maxHops=0" });
+    } else if (this.modelProvider.decideQueryHop && shouldAskModelForExpansion(directMatches)) {
+      const expanded = await this.expandMatchesWithModel(input.text, interpretation, directMatches, limit, maxHops, trace);
       matches = expanded.matches;
       traversal = expanded.traversal;
+      await trace("graph.expand.model.complete", { matches: matches.length, hops: traversal.length });
+    } else if (this.modelProvider.decideQueryHop) {
+      matches = directMatches;
+      await trace("graph.expand.model.skipped", { reason: expansionSkipReason(directMatches) });
     } else {
       const expanded = await this.expandEntityMatches(directMatches, limit);
       matches = dedupeMatches([...directMatches, ...expanded]).slice(0, limit);
+      await trace("graph.expand.entities", { addedMatches: expanded.length, matches: matches.length });
     }
-    const answer = await this.modelProvider.synthesizeAnswer({ query: input.text, interpretation, matches });
+    let answer = "";
+    if (input.synthesize !== false) {
+      answer = await this.modelProvider.synthesizeAnswer({ query: input.text, interpretation, matches });
+      await trace("model.synthesizeAnswer", { answerChars: answer.length });
+    } else {
+      await trace("model.synthesizeAnswer.skipped", { reason: "synthesize=false" });
+    }
+    await trace("query.complete", { matches: matches.length });
     return { query: input.text, interpretation, matches, answer, traversal };
   }
 
   async link(input: { from: string; to: string; type: string; description?: string }): Promise<Relation> {
     await this.ensureReady();
     const timestamp = nowIso();
+    const graph = await this.graphStore.graph();
+    const entityIds = new Set(graph.entities.map((entity) => entity.id));
+    const missingIds = [input.from, input.to].filter((id) => !entityIds.has(id));
+    if (missingIds.length > 0) {
+      throw new Error(`Cannot create relation with unknown entity id(s): ${missingIds.join(", ")}`);
+    }
     const relation: Relation = {
       id: stableId("relation", [input.from, input.type, input.to]),
       sourceId: input.from,
@@ -212,7 +242,9 @@ export class MemoryEngine {
 
   async rebuild(): Promise<void> {
     await this.ensureReady();
-    await this.graphStore.rebuild(await this.vaultStore.readSnapshot());
+    const snapshot = await this.vaultStore.readSnapshot();
+    await this.graphStore.rebuild(snapshot);
+    await this.vaultStore.repairLinks?.();
   }
 
   async reindex(): Promise<void> {
@@ -264,7 +296,7 @@ export class MemoryEngine {
     });
 
     try {
-      await import("node:sqlite");
+      await importNodeSqlite();
       checks.push({ name: "node:sqlite", ok: true, message: "node:sqlite is importable." });
     } catch (error) {
       checks.push({ name: "node:sqlite", ok: false, message: error instanceof Error ? error.message : String(error) });
@@ -312,7 +344,8 @@ export class MemoryEngine {
     interpretation: Awaited<ReturnType<ModelProvider["extractQuery"]>>,
     directMatches: MemoryMatch[],
     limit: number,
-    maxHops: number
+    maxHops: number,
+    trace?: QueryProgressReporter
   ): Promise<{ matches: MemoryMatch[]; traversal: QueryTraversalStep[] }> {
     const traversal: QueryTraversalStep[] = [];
     const visitedNodeIds = new Set<string>();
@@ -321,6 +354,7 @@ export class MemoryEngine {
 
     for (let hop = 0; hop < maxHops; hop += 1) {
       const availableCandidates = candidates.filter((candidate) => !visitedNodeIds.has(candidate.id));
+      await trace?.("graph.expand.model.candidates", { hop, candidates: availableCandidates.length });
       if (availableCandidates.length === 0) break;
 
       const decision = await this.modelProvider.decideQueryHop?.({
@@ -332,6 +366,11 @@ export class MemoryEngine {
         candidates: availableCandidates,
         visitedNodeIds: [...visitedNodeIds]
       });
+      await trace?.("model.decideQueryHop", {
+        hop,
+        continue: Boolean(decision?.continue),
+        selectedNodes: decision?.nodeIds.length ?? 0
+      });
       if (!decision?.continue) break;
 
       const candidateIds = new Set(availableCandidates.map((candidate) => candidate.id));
@@ -342,6 +381,12 @@ export class MemoryEngine {
 
       for (const nodeId of selectedNodeIds) visitedNodeIds.add(nodeId);
       const expanded = await this.expandNodes(selectedNodeIds, limit);
+      await trace?.("graph.expandNodes", {
+        hop,
+        selectedNodes: selectedNodeIds.length,
+        addedMatches: expanded.matches.length,
+        candidates: expanded.candidates.length
+      });
       matches = dedupeMatches([...matches, ...expanded.matches]).slice(0, limit);
       traversal.push({
         hop: hop + 1,
@@ -391,31 +436,6 @@ export async function createDefaultEngine(vaultPath: string): Promise<MemoryEngi
   return MemoryEngine.create({ vaultPath, config });
 }
 
-function createModelProvider(config: AgentMemoryConfig): ModelProvider {
-  if (config.model.provider === "copilot-cli") {
-    return new CopilotCliModelProvider({
-      command: config.model.command ?? "copilot",
-      args: config.model.args ?? ["ask", "{prompt}"],
-      promptInput: config.model.promptInput ?? "argument",
-      timeoutMs: config.model.timeoutMs
-    });
-  }
-
-  return new CopilotSdkModelProvider({
-    model: config.model.model,
-    reasoningEffort: config.model.reasoningEffort,
-    timeoutMs: config.model.timeoutMs,
-    cliPath: config.model.cliPath,
-    cliUrl: config.model.cliUrl,
-    cliArgs: config.model.cliArgs,
-    cwd: config.model.cwd,
-    configDir: config.model.configDir,
-    githubToken: config.model.githubToken,
-    useLoggedInUser: config.model.useLoggedInUser,
-    logLevel: config.model.logLevel
-  });
-}
-
 function dedupeMatches<T extends { kind: string; id: string }>(matches: T[]): T[] {
   const seen = new Set<string>();
   return matches.filter((match) => {
@@ -447,10 +467,38 @@ function entityCandidatesFromMatches(matches: MemoryMatch[]): QueryHopCandidate[
   );
 }
 
+function shouldAskModelForExpansion(matches: MemoryMatch[]): boolean {
+  return matches.length > 0 && matches.every((match) => match.kind === "entity");
+}
+
+function expansionSkipReason(matches: MemoryMatch[]): string {
+  if (matches.length === 0) return "no direct matches";
+  return "direct matches already include evidence";
+}
+
 function normalizeMaxHops(value: number | undefined): number {
   if (value === undefined) return DEFAULT_MAX_HOPS;
   if (!Number.isFinite(value)) return DEFAULT_MAX_HOPS;
   return Math.min(Math.max(Math.trunc(value), 0), MAX_HOPS);
+}
+
+type QueryProgressReporter = (stage: string, details?: Record<string, unknown>) => Promise<void>;
+
+function createQueryTracer(onProgress?: QueryInput["onProgress"]): QueryProgressReporter {
+  const startedAt = Date.now();
+  let lastAt = startedAt;
+  return async (stage: string, details?: Record<string, unknown>) => {
+    if (!onProgress) return;
+    const now = Date.now();
+    const event: QueryProgressEvent = {
+      stage,
+      durationMs: now - lastAt,
+      totalMs: now - startedAt,
+      details
+    };
+    lastAt = now;
+    await onProgress(event);
+  };
 }
 
 function isSupportedNode(): boolean {

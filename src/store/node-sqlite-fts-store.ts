@@ -2,6 +2,7 @@ import { dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
 import type { GraphStore } from "./graph-store.js";
 import type { Entity, Episode, GraphSnapshot, MemoryMatch, MemoryStatus, Relation, SourceRef } from "../types.js";
+import { importNodeSqlite } from "../utils/node-sqlite.js";
 
 const SCHEMA_VERSION = 1;
 
@@ -420,7 +421,7 @@ export class NodeSqliteFtsGraphStore implements GraphStore {
 }
 
 async function openDatabase(path: string): Promise<DatabaseSync> {
-  const sqlite = (await import("node:sqlite")) as unknown as { DatabaseSync: new (path: string) => DatabaseSync };
+  const sqlite = (await importNodeSqlite()) as unknown as { DatabaseSync: new (path: string) => DatabaseSync };
   return new sqlite.DatabaseSync(path);
 }
 

@@ -1,13 +1,54 @@
-import type { ExtractedMemory, MemoryMatch, QueryHopCandidate, QueryHopDecision, QueryInterpretation } from "../types.js";
+import type { EntityType, ExtractedMemory, MemoryMatch, QueryHopCandidate, QueryHopDecision, QueryInterpretation } from "../types.js";
 
 export function extractionPrompt(text: string): string {
+  const template = {
+    summary: "One concise sentence summarizing the durable memory.",
+    entities: [
+      {
+        name: "Exact entity name, for example cashier.temporary_receipt",
+        type: "concept",
+        aliases: ["short alias"],
+        tags: ["short tag"],
+        summary: "One concise sentence about this entity.",
+        confidence: 0.8,
+        externalRefs: {
+          key: "string value"
+        }
+      }
+    ],
+    relations: [
+      {
+        sourceId: "Exact source entity name from entities[].name",
+        targetId: "Exact target entity name from entities[].name",
+        predicate: "short_snake_case_predicate",
+        description: "One concise sentence explaining the relation.",
+        weight: 1,
+        confidence: 0.8,
+        evidenceIds: []
+      }
+    ]
+  };
+
   return [
-    "Extract agent memory as strict JSON with keys summary, entities, relations.",
-    "Each entity must include name and may include type, aliases, tags, summary, confidence.",
-    "Entity type must be one of concept, person, project, bug, rule, artifact, decision, topic, unknown.",
-    "Relations should use sourceId and targetId as entity names when stable IDs are unknown.",
-    "Do not wrap the JSON in markdown.",
+    "Extract durable agent memory from the input and return only strict JSON.",
+    "Use exactly this top-level shape: summary, entities, relations.",
     "",
+    "JSON template:",
+    JSON.stringify(template, null, 2),
+    "",
+    "Field rules:",
+    "summary must be a string.",
+    "entities must be an array. Each entity must include name. Use [] when there are no aliases or tags.",
+    "Entity name, summary, aliases, tags, externalRefs values, relation IDs, predicates, and descriptions must be strings.",
+    "Do not return nested objects or arrays inside string fields.",
+    "Entity type must be one of concept, person, project, bug, rule, artifact, decision, topic, unknown.",
+    "Use artifact for concrete files, tables, APIs, commands, tools, documents, and other named technical objects.",
+    "Preserve database, schema, table, API, file, and command names exactly, including dots and underscores.",
+    "relations must be an array. Use sourceId and targetId values that exactly match entity names from entities.",
+    "Use [] for relations when the input only defines one entity or no durable relationship.",
+    "Do not answer or explain the input. Do not wrap the JSON in markdown.",
+    "",
+    "Input:",
     text
   ].join("\n");
 }
@@ -26,8 +67,9 @@ export function queryPrompt(text: string): string {
 export function answerPrompt(query: string, interpretation: QueryInterpretation, matches: MemoryMatch[]): string {
   return [
     "Answer the user's memory query in natural language using only the structured memory matches below.",
-    "If the matches are empty or insufficient, say that the memory store does not contain enough information.",
-    "Keep the answer concise and cite relevant match IDs inline when useful.",
+    "Keep the answer to at most two short sentences.",
+    "Do not list match IDs, entity IDs, keywords, or every matched item unless the user explicitly asks for details.",
+    "If the matches are empty or insufficient, say only that the memory store does not contain enough information to answer.",
     "",
     `Query: ${query}`,
     "",
@@ -52,8 +94,10 @@ export function queryHopPrompt(input: {
     "Decide whether this memory graph query needs another hop.",
     "Return strict JSON with keys continue, nodeIds, reason.",
     "continue must be a boolean.",
-    "nodeIds must contain only IDs from Candidate nodes and should include at most 5 nodes.",
-    "Choose another hop only when the current matches are insufficient and the candidate nodes are likely to add relevant evidence.",
+    "Default to continue=false.",
+    "Only continue when the current matches do not contain enough evidence to answer the query, the query has a specific missing entity/relation/detail, and the candidate nodes are very likely to provide that missing evidence.",
+    "Do not continue for broad context, curiosity, weak associations, or when the current matches already include direct evidence for the requested entity or relation.",
+    "nodeIds must contain only IDs from Candidate nodes and should include at most 3 nodes.",
     "Do not exceed the max hop budget. Do not wrap the JSON in markdown.",
     "",
     `Query: ${input.query}`,
@@ -156,13 +200,66 @@ export function parseRequiredQueryHopDecision(value: string | undefined): QueryH
 }
 
 export function normalizeExtraction(extraction: ExtractedMemory): ExtractedMemory {
+  const entities = Array.isArray(extraction.entities) ? extraction.entities : [];
+  const relations = Array.isArray(extraction.relations) ? extraction.relations : [];
+
   return {
-    summary: extraction.summary || "",
-    entities: (extraction.entities ?? []).filter((entity) => entity.name),
-    relations: extraction.relations ?? []
+    summary: textValue(extraction.summary),
+    entities: entities
+      .map((entity) => ({
+        name: textValue(entity.name),
+        type: entityTypeValue(entity.type),
+        summary: optionalTextValue(entity.summary),
+        aliases: stringArray(entity.aliases),
+        tags: stringArray(entity.tags),
+        confidence: numberValue(entity.confidence),
+        externalRefs: stringRecord(entity.externalRefs)
+      }))
+      .filter((entity) => entity.name),
+    relations: relations
+      .map((relation) => ({
+        sourceId: textValue(relation.sourceId),
+        targetId: textValue(relation.targetId),
+        predicate: textValue(relation.predicate),
+        description: optionalTextValue(relation.description),
+        weight: numberValue(relation.weight),
+        confidence: numberValue(relation.confidence),
+        evidenceIds: stringArray(relation.evidenceIds)
+      }))
+      .filter((relation) => relation.sourceId && relation.targetId && relation.predicate)
   };
 }
 
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.map(String).map((item) => item.trim()).filter(Boolean) : [];
+}
+
+function textValue(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (value && typeof value === "object") return JSON.stringify(value);
+  return "";
+}
+
+function optionalTextValue(value: unknown): string | undefined {
+  const text = textValue(value);
+  return text || undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function stringRecord(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, textValue(item)]));
+}
+
+function entityTypeValue(value: unknown): EntityType | undefined {
+  const type = textValue(value);
+  return isEntityType(type) ? type : undefined;
+}
+
+function isEntityType(value: string): value is EntityType {
+  return ["concept", "person", "project", "bug", "rule", "artifact", "decision", "topic", "unknown"].includes(value);
 }

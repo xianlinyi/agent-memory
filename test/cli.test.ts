@@ -54,6 +54,110 @@ test("cli config set and get updates vault config", async () => {
   }
 });
 
+test("cli query json is compact unless details are requested", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-query-json-"));
+  const script = `
+const fs = require("node:fs");
+const input = fs.readFileSync(0, "utf8");
+if (input.includes("Extract durable agent memory")) {
+  console.log(JSON.stringify({
+    summary: "etr represents cashir.temporary_receipt.",
+    entities: [
+      { name: "etr", type: "concept", summary: "etr is the contents of cashir.temporary_receipt." },
+      { name: "cashir.temporary_receipt", type: "artifact", summary: "Temporary receipt table." }
+    ],
+    relations: [
+      {
+        sourceId: "etr",
+        targetId: "cashir.temporary_receipt",
+        predicate: "represents_table_contents",
+        description: "etr is the contents of cashir.temporary_receipt."
+      },
+      {
+        sourceId: "etr",
+        targetId: "cashir.temporary_receipt",
+        predicate: "represents_table_contents",
+        description: "etr represents the contents of cashir.temporary_receipt."
+      }
+    ]
+  }));
+} else if (input.includes("Interpret this memory search query")) {
+  console.log(JSON.stringify({
+    keywords: ["etr", "下拉框"],
+    entities: ["etr"],
+    predicates: ["未显示"],
+    expandedQuery: "etr 下拉框 保存 未显示"
+  }));
+} else if (input.includes("Decide whether this memory graph query needs another hop")) {
+  console.log(JSON.stringify({ continue: false, nodeIds: [], reason: "enough evidence" }));
+} else if (input.includes("Answer the user's memory query")) {
+  console.log("记忆库没有足够信息回答。");
+}
+`;
+
+  try {
+    await execFileAsync(process.execPath, [cliPath, "init", "--vault", vaultPath]);
+    await execFileAsync(process.execPath, [cliPath, "config", "set", "model.provider", "copilot-cli", "--vault", vaultPath]);
+    await execFileAsync(process.execPath, [cliPath, "config", "set", "model.command", process.execPath, "--vault", vaultPath]);
+    await execFileAsync(process.execPath, [cliPath, "config", "set", "model.args", JSON.stringify(["-e", script]), "--vault", vaultPath]);
+    await execFileAsync(process.execPath, [cliPath, "config", "set", "model.promptInput", "stdin", "--vault", vaultPath]);
+    await execFileAsync(process.execPath, [cliPath, "ingest", "etr就是cashir.temporary_receipt表的内容", "--vault", vaultPath]);
+
+    const compact = await execFileAsync(process.execPath, [
+      cliPath,
+      "query",
+      "我创建etr的时候选了下拉框的值但是点保存以后没有显示",
+      "--vault",
+      vaultPath,
+      "--json"
+    ]);
+    const compactJson = JSON.parse(compact.stdout) as {
+      query?: unknown;
+      searchTerms: string[];
+      assumptions: string[];
+      relationships: Array<{ source?: string; predicate: string; target?: string; description: string }>;
+      evidence: Array<{ kind: string; title: string; content: string }>;
+      matchCount: number;
+      answer?: string;
+      matches?: unknown;
+      interpretation?: unknown;
+      interpretedQuery?: unknown;
+      traversal?: unknown;
+    };
+    assert.equal(compactJson.answer, undefined);
+    assert.equal(compactJson.query, undefined);
+    assert.ok(compactJson.searchTerms.includes("etr"));
+    assert.ok(compactJson.assumptions.includes("etr represents_table_contents cashir.temporary_receipt"));
+    assert.ok(compactJson.relationships.some((item) => item.predicate === "represents_table_contents"));
+    assert.ok(compactJson.relationships.some((item) => item.source === "etr" && item.target === "cashir.temporary_receipt"));
+    assert.equal(compactJson.relationships.filter((item) => item.source === "etr" && item.predicate === "represents_table_contents" && item.target === "cashir.temporary_receipt").length, 1);
+    assert.ok(compactJson.evidence.some((item) => item.title === "etr"));
+    assert.equal(compactJson.evidence.filter((item) => item.kind === "entity" && item.title === "etr").length, 1);
+    assert.ok(compactJson.evidence.length <= 5);
+    assert.equal(typeof compactJson.matchCount, "number");
+    assert.equal(compactJson.matches, undefined);
+    assert.equal(compactJson.interpretation, undefined);
+    assert.equal(compactJson.interpretedQuery, undefined);
+    assert.equal(compactJson.traversal, undefined);
+    assert.ok(compactJson.evidence.every((item) => !("id" in item) && !("score" in item) && !("metadata" in item)));
+
+    const detailed = await execFileAsync(process.execPath, [
+      cliPath,
+      "query",
+      "我创建etr的时候选了下拉框的值但是点保存以后没有显示",
+      "--vault",
+      vaultPath,
+      "--json",
+      "--details"
+    ]);
+    const detailedJson = JSON.parse(detailed.stdout) as { matches: unknown[]; interpretation: unknown };
+    assert.ok(Array.isArray(detailedJson.matches));
+    assert.ok(detailedJson.interpretation);
+  } finally {
+    await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
 test("cli uses a user default vault path when --vault is omitted", async () => {
   const rootPath = await mkdtemp(join(tmpdir(), "agent-memory-default-root-"));
   const userConfigPath = join(rootPath, "user-config.json");
