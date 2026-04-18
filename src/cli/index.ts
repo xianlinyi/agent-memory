@@ -733,8 +733,8 @@ Usage:
   agent-memory init
   agent-memory init --vault <path>
   agent-memory ingest <text|file> [--source <label>] [--vault <path>]
-  agent-memory query <text> [--limit n] [--max-hops n] [--details] [--json] [--vault <path>]
-  agent-memory link --from <id> --to <id> --type <predicate> [--vault <path>]
+  agent-memory query <text> [--limit n] [--max-hops n] [--details] [--json] [--answer] [--vault <path>]
+  agent-memory link --from <id> --to <id> --type <predicate> [--description <text>] [--vault <path>]
   agent-memory graph [--entity <id>] [--json] [--vault <path>]
   agent-memory rebuild [--vault <path>]
   agent-memory reindex [--vault <path>]
