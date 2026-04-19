@@ -194,6 +194,14 @@ agent-memory ingest ./notes/project-atlas.md --vault ./memory-vault --source "Pr
 
 `ingest` 的参数既可以是文本，也可以是文件路径。CLI 会先尝试按文件读取；读取失败时把参数当作文本。
 
+使用 `--json` 时，返回结果会包含 `meta.status`：
+
+- `created`: 新增记忆。
+- `merged`: 增强合并了已有实体或关系。
+- `duplicate`: 完全重复，已复用已有 episode，不再重复存储。
+
+`meta.duplicate` 可以直接判断是否跳过，`meta.entitiesMerged` 和 `meta.relationsMerged` 会给出本次增强的已有记录数量。
+
 写入时模型会抽取：
 
 - `entities`: 人、项目、bug、规则、概念、产物、决策等。
@@ -451,13 +459,14 @@ const memory = await MemoryEngine.create({ vaultPath: "./memory-vault" });
 
 try {
   await memory.init();
-  await memory.ingest({
+  const ingest = await memory.ingest({
     text: "Project Atlas uses Obsidian for local-first memory.",
     source: {
       kind: "message",
       label: "Planning chat"
     }
   });
+  console.log(ingest.meta.status); // "created"、"merged" 或 "duplicate"
 
   const result = await memory.query({
     text: "How does Atlas store memory?",
@@ -471,6 +480,8 @@ try {
   await memory.close();
 }
 ```
+
+`ingest.meta` 用于判断这次写入是新增、合并增强，还是因为完全重复而跳过。`meta.duplicate` 为 `true` 表示规范化后的观察文本已经存在；`meta.entitiesMerged` 和 `meta.relationsMerged` 会返回本次增强了多少已有记录。
 
 查询时关闭答案合成：
 

@@ -3,7 +3,15 @@ import assert from "node:assert/strict";
 import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { MemoryEngine, type ModelProvider, type ExtractedMemory, type QueryHopDecision, type QueryInterpretation } from "../src/index.js";
+import {
+  MemoryEngine,
+  ObsidianVaultStore,
+  type ModelProvider,
+  type ExtractedMemory,
+  type GraphSnapshot,
+  type QueryHopDecision,
+  type QueryInterpretation
+} from "../src/index.js";
 import { answerPrompt, extractionPrompt, queryHopPrompt } from "../src/model/extraction.js";
 import { stringifyMarkdownDocument } from "../src/utils/frontmatter.js";
 
@@ -366,6 +374,177 @@ test("engine normalizes non-string extraction fields before storing", async () =
     assert.equal(result.relations.length, 1);
     assert.equal(result.entities[0]?.summary, "{\"text\":\"etr is data from cashier.temporary_receipt\"}");
     assert.equal(result.relations[0]?.description, "{\"text\":\"etr maps to cashier.temporary_receipt data\"}");
+  } finally {
+    await engine.close();
+    await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
+test("engine skips storing exact duplicate memory text", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-dedupe-"));
+  let extractionCalls = 0;
+  const engine = await MemoryEngine.create({
+    vaultPath,
+    modelProvider: {
+      async extractMemory() {
+        extractionCalls += 1;
+        return {
+          summary: "Project Atlas uses Obsidian memory",
+          entities: [
+            { name: "Project Atlas", type: "project", aliases: ["Atlas"], tags: ["project"], confidence: 0.9 },
+            { name: "Obsidian", type: "artifact", aliases: [], tags: ["tool"], confidence: 0.9 }
+          ],
+          relations: [{ sourceId: "Project Atlas", targetId: "Obsidian", predicate: "uses", description: "Project Atlas uses Obsidian for memory." }]
+        };
+      },
+      async extractQuery(): Promise<QueryInterpretation> {
+        throw new Error("unused");
+      },
+      async synthesizeAnswer(): Promise<string> {
+        throw new Error("unused");
+      }
+    }
+  });
+
+  try {
+    await engine.init();
+    const first = await engine.ingest({ text: "Project Atlas uses Obsidian for memory." });
+    const second = await engine.ingest({ text: "Project Atlas uses Obsidian for memory." });
+    const snapshot = await engine.export();
+
+    assert.equal(extractionCalls, 1);
+    assert.equal(first.meta.status, "created");
+    assert.equal(second.meta.status, "duplicate");
+    assert.equal(second.meta.duplicate, true);
+    assert.equal(second.episode.id, first.episode.id);
+    assert.equal(snapshot.episodes.length, 1);
+    assert.equal(snapshot.entities.length, 2);
+    assert.equal(snapshot.relations.length, 1);
+  } finally {
+    await engine.close();
+    await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
+test("engine enhances similar entities and relations instead of creating near duplicates", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-merge-"));
+  const extractions: ExtractedMemory[] = [
+    {
+      summary: "Project Atlas uses Obsidian memory",
+      entities: [
+        { name: "Project Atlas", type: "project", summary: "Project Atlas stores memory.", aliases: ["Atlas"], tags: ["project"], confidence: 0.7 },
+        { name: "Obsidian", type: "artifact", summary: "Obsidian is the memory vault.", aliases: [], tags: ["tool"], confidence: 0.8 }
+      ],
+      relations: [{ sourceId: "Project Atlas", targetId: "Obsidian", predicate: "uses", description: "Project Atlas uses Obsidian for memory.", confidence: 0.7 }]
+    },
+    {
+      summary: "Atlas uses Obsidian for local first memory",
+      entities: [
+        { name: "Atlas", type: "project", summary: "Atlas stores local-first agent memory.", aliases: ["Project Atlas"], tags: ["local-first"], confidence: 0.95 },
+        { name: "Obsidian", type: "artifact", summary: "Obsidian keeps the Markdown vault.", aliases: [], tags: ["markdown"], confidence: 0.9 }
+      ],
+      relations: [{ sourceId: "Atlas", targetId: "Obsidian", predicate: "uses", description: "Atlas uses Obsidian for local-first memory.", confidence: 0.95 }]
+    }
+  ];
+  const engine = await MemoryEngine.create({
+    vaultPath,
+    modelProvider: {
+      async extractMemory() {
+        const next = extractions.shift();
+        if (!next) throw new Error("unexpected extraction");
+        return next;
+      },
+      async extractQuery(): Promise<QueryInterpretation> {
+        throw new Error("unused");
+      },
+      async synthesizeAnswer(): Promise<string> {
+        throw new Error("unused");
+      }
+    }
+  });
+
+  try {
+    await engine.init();
+    const first = await engine.ingest({ text: "Project Atlas uses Obsidian for memory." });
+    const second = await engine.ingest({ text: "Atlas uses Obsidian for local-first memory." });
+    const snapshot = await engine.export();
+    const project = snapshot.entities.find((entity) => entity.name === "Project Atlas");
+    const relation = snapshot.relations.find((item) => item.predicate === "uses");
+
+    assert.equal(snapshot.entities.length, 2);
+    assert.equal(snapshot.relations.length, 1);
+    assert.equal(second.meta.status, "merged");
+    assert.equal(second.meta.merged, true);
+    assert.equal(second.meta.entitiesMerged, 2);
+    assert.equal(second.meta.relationsMerged, 1);
+    assert.equal(second.entities.find((entity) => entity.name === "Project Atlas")?.id, first.entities[0]?.id);
+    assert.ok(project?.summary?.includes("Project Atlas stores memory."));
+    assert.ok(project?.summary?.includes("Atlas stores local-first agent memory."));
+    assert.deepEqual(project?.tags.sort(), ["local-first", "project"]);
+    assert.ok(relation?.description?.includes("Project Atlas uses Obsidian for memory."));
+    assert.ok(relation?.description?.includes("Atlas uses Obsidian for local-first memory."));
+    assert.equal(relation?.evidenceIds.length, 2);
+  } finally {
+    await engine.close();
+    await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
+test("engine uses SQLite duplicate and merge lookups without reading the full vault snapshot", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-fast-ingest-"));
+  class SnapshotFailingVaultStore extends ObsidianVaultStore {
+    override async readSnapshot(): Promise<GraphSnapshot> {
+      throw new Error("readSnapshot should not be called on the SQLite fast ingest path");
+    }
+  }
+
+  const extractions: ExtractedMemory[] = [
+    {
+      summary: "Project Atlas uses Obsidian memory",
+      entities: [
+        { name: "Project Atlas", type: "project", aliases: ["Atlas"], tags: ["project"], confidence: 0.9 },
+        { name: "Obsidian", type: "artifact", aliases: [], tags: ["tool"], confidence: 0.9 }
+      ],
+      relations: [{ sourceId: "Project Atlas", targetId: "Obsidian", predicate: "uses", description: "Project Atlas uses Obsidian for memory." }]
+    },
+    {
+      summary: "Atlas uses Obsidian for local first memory",
+      entities: [
+        { name: "Atlas", type: "project", aliases: ["Project Atlas"], tags: ["local-first"], confidence: 0.95 },
+        { name: "Obsidian", type: "artifact", aliases: [], tags: ["markdown"], confidence: 0.9 }
+      ],
+      relations: [{ sourceId: "Atlas", targetId: "Obsidian", predicate: "uses", description: "Atlas uses Obsidian for local-first memory." }]
+    }
+  ];
+
+  const engine = await MemoryEngine.create({
+    vaultPath,
+    vaultStore: new SnapshotFailingVaultStore(vaultPath),
+    modelProvider: {
+      async extractMemory() {
+        const next = extractions.shift();
+        if (!next) throw new Error("unexpected extraction");
+        return next;
+      },
+      async extractQuery(): Promise<QueryInterpretation> {
+        throw new Error("unused");
+      },
+      async synthesizeAnswer(): Promise<string> {
+        throw new Error("unused");
+      }
+    }
+  });
+
+  try {
+    await engine.init();
+    await engine.ingest({ text: "Project Atlas uses Obsidian for memory." });
+    await engine.ingest({ text: "Atlas uses Obsidian for local-first memory." });
+    await engine.ingest({ text: "Project Atlas uses Obsidian for memory." });
+    const snapshot = await engine.export();
+
+    assert.equal(snapshot.episodes.length, 2);
+    assert.equal(snapshot.entities.length, 2);
+    assert.equal(snapshot.relations.length, 1);
   } finally {
     await engine.close();
     await rm(vaultPath, { recursive: true, force: true });

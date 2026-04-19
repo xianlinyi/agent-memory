@@ -133,10 +133,11 @@ const memory = await MemoryEngine.create({ vaultPath: "./memory-vault" });
 
 try {
   await memory.init();
-  await memory.ingest({
+  const ingest = await memory.ingest({
     text: "Project Atlas uses Obsidian for local-first memory.",
     source: { kind: "message", label: "Planning chat" }
   });
+  console.log(ingest.meta.status); // "created", "merged", or "duplicate"
 
   const result = await memory.query({
     text: "How does Atlas store memory?",
@@ -150,6 +151,8 @@ try {
   await memory.close();
 }
 ```
+
+`ingest.meta` tells callers whether the input created new memory, enhanced existing records, or was skipped as a duplicate. For example, `meta.duplicate` is `true` when the normalized observation text already exists, and `meta.entitiesMerged` / `meta.relationsMerged` report how many existing records were enhanced.
 
 Tests and integrations can inject custom providers or stores:
 

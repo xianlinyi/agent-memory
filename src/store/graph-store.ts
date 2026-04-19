@@ -13,4 +13,10 @@ export interface GraphStore {
   rebuild(snapshot: GraphSnapshot): Promise<void>;
   reindex(): Promise<void>;
   status(): Promise<MemoryStatus>;
+  findEpisodeByText?(text: string): Promise<Episode | undefined>;
+  findEntitiesByIds?(ids: string[]): Promise<Entity[]>;
+  findEntityCandidates?(input: { name: string; aliases?: string[]; type?: Entity["type"]; limit?: number }): Promise<Entity[]>;
+  findRelationByTriple?(input: { sourceId: string; predicate: string; targetId: string }): Promise<Relation | undefined>;
+  findRelationsByEvidenceId?(episodeId: string): Promise<Relation[]>;
+  findSourceById?(id: string): Promise<SourceRef | undefined>;
 }

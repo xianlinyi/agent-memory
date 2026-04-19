@@ -13,7 +13,7 @@ import {
   writeUserConfig
 } from "../config.js";
 import { MemoryEngineExecutor } from "../core/engine-executor.js";
-import type { AgentMemoryConfig, MemoryMatch, QueryProgressEvent, QueryResult } from "../types.js";
+import type { AgentMemoryConfig, IngestResult, MemoryMatch, QueryProgressEvent, QueryResult } from "../types.js";
 import type { GraphSnapshot } from "../types.js";
 import { appendNodeOption, createCliLogger, type Logger } from "../utils/logger.js";
 
@@ -147,8 +147,8 @@ async function handleIngest(engine: MemoryEngine, parsed: ParsedArgs, logger: Lo
       }
     })
   );
-  await logger.debug(`ingest complete entities=${result.entities.length} relations=${result.relations.length}`);
-  printJsonOrText(parsed, result, `Ingested ${result.entities.length} entities, ${result.relations.length} relations, and 1 episode.`);
+  await logger.debug(`ingest complete status=${result.meta.status} entities=${result.entities.length} relations=${result.relations.length}`);
+  printJsonOrText(parsed, result, ingestMessage(result));
 }
 
 async function handleQuery(engine: MemoryEngine, parsed: ParsedArgs, logger: Logger): Promise<void> {
@@ -679,6 +679,16 @@ function parseConfigValue(value: string): unknown {
 function formatConfigValue(value: unknown): string {
   if (typeof value === "string") return value;
   return JSON.stringify(value, null, 2);
+}
+
+function ingestMessage(result: IngestResult): string {
+  if (result.meta.duplicate) {
+    return "Skipped duplicate memory; existing episode was reused.";
+  }
+  if (result.meta.merged) {
+    return `Enhanced existing memory: ${result.meta.entitiesMerged} entities merged, ${result.meta.relationsMerged} relations merged, and 1 episode recorded.`;
+  }
+  return `Ingested ${result.entities.length} entities, ${result.relations.length} relations, and 1 episode.`;
 }
 
 function snapshotToMarkdown(snapshot: Awaited<ReturnType<MemoryEngine["export"]>>): string {

@@ -14,6 +14,7 @@ import type {
   Episode,
   GraphSnapshot,
   IngestInput,
+  IngestResult,
   MemoryMatch,
   MemoryStatus,
   QueryHopCandidate,
@@ -86,12 +87,16 @@ export class MemoryEngine {
     await this.graphStore.close();
   }
 
-  async ingest(input: IngestInput): Promise<{ source?: SourceRef; episode: Episode; entities: Entity[]; relations: Relation[] }> {
+  async ingest(input: IngestInput): Promise<IngestResult> {
     await this.ensureReady();
     const timestamp = nowIso();
-    const extracted = normalizeExtraction(await this.modelProvider.extractMemory({ text: input.text }));
-    const source = input.source
-      ? await this.createSource({
+    let existingSnapshot: GraphSnapshot | undefined;
+    const getExistingSnapshot = async () => {
+      existingSnapshot ??= await this.vaultStore.readSnapshot();
+      return existingSnapshot;
+    };
+    const sourceDraft = input.source
+      ? {
           id: stableId("source", [input.source.kind ?? "cli", input.source.label, input.source.uri, input.text]),
           kind: input.source.kind ?? "cli",
           label: input.source.label ?? input.source.uri ?? "CLI input",
@@ -99,16 +104,40 @@ export class MemoryEngine {
           text: input.text,
           createdAt: timestamp,
           updatedAt: timestamp
-        })
+        }
       : undefined;
+    const duplicateEpisode = this.graphStore.findEpisodeByText
+      ? await this.graphStore.findEpisodeByText(input.text)
+      : findExactEpisode((await getExistingSnapshot()).episodes, input.text);
+    if (duplicateEpisode) {
+      const duplicateSnapshot = existingSnapshot ?? (await this.graphStore.graph());
+      return {
+        source: duplicateEpisode.sourceId
+          ? (await this.graphStore.findSourceById?.(duplicateEpisode.sourceId)) ?? duplicateSnapshot.sources.find((source) => source.id === duplicateEpisode.sourceId)
+          : undefined,
+        episode: duplicateEpisode,
+        entities:
+          (await this.graphStore.findEntitiesByIds?.(duplicateEpisode.entityIds)) ??
+          duplicateSnapshot.entities.filter((entity) => duplicateEpisode.entityIds.includes(entity.id)),
+        relations:
+          (await this.graphStore.findRelationsByEvidenceId?.(duplicateEpisode.id)) ??
+          duplicateSnapshot.relations.filter((relation) => relation.evidenceIds.includes(duplicateEpisode.id)),
+        meta: ingestMeta("duplicate", 0, 0)
+      };
+    }
+
+    const extracted = normalizeExtraction(await this.modelProvider.extractMemory({ text: input.text }));
+    const source = sourceDraft ? await this.createSource(sourceDraft) : undefined;
 
     const entities: Entity[] = [];
     const entityIdByName = new Map<string, string>();
+    let entitiesMerged = 0;
+    let relationsMerged = 0;
 
     for (const partial of extracted.entities) {
-      const id = stableId("entity", [partial.name, partial.type]);
-      const entity: Entity = {
-        id,
+      const generatedId = stableId("entity", [partial.name, partial.type]);
+      const incoming: Entity = {
+        id: generatedId,
         name: partial.name,
         type: partial.type ?? "concept",
         summary: partial.summary,
@@ -119,11 +148,21 @@ export class MemoryEngine {
         updatedAt: timestamp,
         externalRefs: partial.externalRefs
       };
+      const candidates =
+        (await this.graphStore.findEntityCandidates?.({ name: incoming.name, aliases: incoming.aliases, type: incoming.type, limit: 20 })) ??
+        (await getExistingSnapshot()).entities;
+      const match = findSimilarEntity(candidates, incoming);
+      const entity = match ? mergeEntity(match, incoming, timestamp) : incoming;
+      if (match) entitiesMerged += 1;
       const written = await this.vaultStore.writeEntity(entity);
       await this.graphStore.upsertEntity(written);
       entities.push(written);
-      entityIdByName.set(partial.name, id);
-      entityIdByName.set(id, id);
+      entityIdByName.set(partial.name, written.id);
+      entityIdByName.set(generatedId, written.id);
+      entityIdByName.set(written.id, written.id);
+      for (const alias of written.aliases) {
+        entityIdByName.set(alias, written.id);
+      }
     }
 
     const episode: Episode = {
@@ -158,12 +197,21 @@ export class MemoryEngine {
         createdAt: timestamp,
         updatedAt: timestamp
       };
-      const written = await this.vaultStore.writeRelation(relation);
+      const match = this.graphStore.findRelationByTriple
+        ? await this.graphStore.findRelationByTriple({
+            sourceId: relation.sourceId,
+            predicate: relation.predicate,
+            targetId: relation.targetId
+        })
+        : findSimilarRelation((await getExistingSnapshot()).relations, relation);
+      const mergedRelation = match ? mergeRelation(match, relation, timestamp) : relation;
+      if (match) relationsMerged += 1;
+      const written = await this.vaultStore.writeRelation(mergedRelation);
       await this.graphStore.upsertRelation(written);
       relations.push(written);
     }
 
-    return { source, episode: writtenEpisode, entities, relations };
+    return { source, episode: writtenEpisode, entities, relations, meta: ingestMeta(entitiesMerged + relationsMerged > 0 ? "merged" : "created", entitiesMerged, relationsMerged) };
   }
 
   async query(input: QueryInput): Promise<QueryResult> {
@@ -475,6 +523,147 @@ function shouldAskModelForExpansion(matches: MemoryMatch[]): boolean {
 function expansionSkipReason(matches: MemoryMatch[]): string {
   if (matches.length === 0) return "no direct matches";
   return "direct matches already include evidence";
+}
+
+function ingestMeta(status: IngestResult["meta"]["status"], entitiesMerged: number, relationsMerged: number): IngestResult["meta"] {
+  return {
+    status,
+    duplicate: status === "duplicate",
+    merged: status === "merged",
+    entitiesMerged,
+    relationsMerged
+  };
+}
+
+function findExactEpisode(episodes: Episode[], text: string): Episode | undefined {
+  const normalizedText = normalizeComparableText(text);
+  return episodes.find((episode) => normalizeComparableText(episode.text) === normalizedText);
+}
+
+function findSimilarEntity(entities: Entity[], incoming: Entity): Entity | undefined {
+  const incomingNames = entityComparableNames(incoming);
+  return entities.find((entity) => {
+    if (entity.type !== incoming.type && entity.type !== "unknown" && incoming.type !== "unknown") return false;
+    const existingNames = entityComparableNames(entity);
+    if (incomingNames.some((name) => existingNames.includes(name))) return true;
+    return incomingNames.some((incomingName) => existingNames.some((existingName) => textSimilarity(incomingName, existingName) >= 0.9));
+  });
+}
+
+function findSimilarRelation(relations: Relation[], incoming: Relation): Relation | undefined {
+  return relations.find((relation) => {
+    if (relation.sourceId !== incoming.sourceId || relation.targetId !== incoming.targetId || relation.predicate !== incoming.predicate) return false;
+    return true;
+  });
+}
+
+function mergeEntity(existing: Entity, incoming: Entity, timestamp: string): Entity {
+  return {
+    ...existing,
+    name: preferredText(existing.name, incoming.name),
+    type: existing.type === "unknown" ? incoming.type : existing.type,
+    summary: mergeText(existing.summary, incoming.summary),
+    aliases: uniqueStrings([...existing.aliases, incoming.name, ...incoming.aliases].filter((alias) => normalizeComparableText(alias) !== normalizeComparableText(existing.name))),
+    tags: uniqueStrings([...existing.tags, ...incoming.tags]),
+    confidence: Math.max(existing.confidence, incoming.confidence),
+    createdAt: existing.createdAt,
+    updatedAt: timestamp,
+    externalRefs: { ...existing.externalRefs, ...incoming.externalRefs },
+    filePath: existing.filePath
+  };
+}
+
+function mergeRelation(existing: Relation, incoming: Relation, timestamp: string): Relation {
+  return {
+    ...existing,
+    description: mergeText(existing.description, incoming.description),
+    weight: Math.max(existing.weight, incoming.weight),
+    confidence: Math.max(existing.confidence, incoming.confidence),
+    evidenceIds: uniqueStrings([...existing.evidenceIds, ...incoming.evidenceIds]),
+    createdAt: existing.createdAt,
+    updatedAt: timestamp,
+    filePath: existing.filePath
+  };
+}
+
+function entityComparableNames(entity: Entity): string[] {
+  return uniqueStrings([entity.name, ...entity.aliases].map(normalizeComparableText).filter(Boolean));
+}
+
+function mergeText(existing: string | undefined, incoming: string | undefined): string | undefined {
+  const existingText = existing?.trim();
+  const incomingText = incoming?.trim();
+  if (!existingText) return incomingText;
+  if (!incomingText) return existingText;
+  const existingComparable = normalizeComparableText(existingText);
+  const incomingComparable = normalizeComparableText(incomingText);
+  if (existingComparable === incomingComparable || existingComparable.includes(incomingComparable)) return existingText;
+  if (incomingComparable.includes(existingComparable)) return incomingText;
+  return `${existingText}\n\n${incomingText}`;
+}
+
+function preferredText(existing: string, incoming: string): string {
+  return incoming.length > existing.length && normalizeComparableText(incoming).includes(normalizeComparableText(existing)) ? incoming : existing;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const value of values) {
+    const trimmed = value.trim();
+    const key = normalizeComparableText(trimmed);
+    if (!trimmed || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(trimmed);
+  }
+  return unique;
+}
+
+function textSimilarity(left: string, right: string): number {
+  const normalizedLeft = normalizeComparableText(left);
+  const normalizedRight = normalizeComparableText(right);
+  if (!normalizedLeft || !normalizedRight) return 0;
+  if (normalizedLeft === normalizedRight) return 1;
+  if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) {
+    const shorter = Math.min(normalizedLeft.length, normalizedRight.length);
+    const longer = Math.max(normalizedLeft.length, normalizedRight.length);
+    return shorter / longer;
+  }
+  return Math.max(jaccard(tokenize(normalizedLeft), tokenize(normalizedRight)), jaccard(characterBigrams(normalizedLeft), characterBigrams(normalizedRight)));
+}
+
+function normalizeComparableText(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function tokenize(value: string): string[] {
+  return value.split(/\s+/).filter(Boolean);
+}
+
+function characterBigrams(value: string): string[] {
+  const compact = value.replace(/\s+/g, "");
+  if (compact.length <= 1) return compact ? [compact] : [];
+  const grams: string[] = [];
+  for (let index = 0; index < compact.length - 1; index += 1) {
+    grams.push(compact.slice(index, index + 2));
+  }
+  return grams;
+}
+
+function jaccard(left: string[], right: string[]): number {
+  if (left.length === 0 || right.length === 0) return 0;
+  const leftSet = new Set(left);
+  const rightSet = new Set(right);
+  let intersection = 0;
+  for (const item of leftSet) {
+    if (rightSet.has(item)) intersection += 1;
+  }
+  return intersection / new Set([...leftSet, ...rightSet]).size;
 }
 
 function normalizeMaxHops(value: number | undefined): number {

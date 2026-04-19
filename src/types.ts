@@ -112,6 +112,20 @@ export interface QueryResult {
   traversal?: QueryTraversalStep[];
 }
 
+export interface IngestResult {
+  source?: SourceRef;
+  episode: Episode;
+  entities: Entity[];
+  relations: Relation[];
+  meta: {
+    status: "created" | "merged" | "duplicate";
+    duplicate: boolean;
+    merged: boolean;
+    entitiesMerged: number;
+    relationsMerged: number;
+  };
+}
+
 export interface QueryProgressEvent {
   stage: string;
   durationMs: number;

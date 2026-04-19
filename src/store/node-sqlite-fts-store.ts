@@ -1,5 +1,6 @@
 import { dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import type { GraphStore } from "./graph-store.js";
 import type { Entity, Episode, GraphSnapshot, MemoryMatch, MemoryStatus, Relation, SourceRef } from "../types.js";
 import { importNodeSqlite } from "../utils/node-sqlite.js";
@@ -33,6 +34,7 @@ export class NodeSqliteFtsGraphStore implements GraphStore {
     this.db = await openDatabase(this.options.databasePath);
     this.database.exec("PRAGMA foreign_keys = ON;");
     this.database.exec(SCHEMA_SQL);
+    this.ensureSchemaCompatibility();
     this.database.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(SCHEMA_VERSION, new Date().toISOString());
   }
 
@@ -44,8 +46,8 @@ export class NodeSqliteFtsGraphStore implements GraphStore {
   async upsertEntity(entity: Entity): Promise<void> {
     this.database
       .prepare(
-        `INSERT INTO entities(id, name, type, summary, confidence, created_at, updated_at, external_refs, file_path)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO entities(id, name, type, summary, confidence, created_at, updated_at, external_refs, file_path, normalized_name)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            name=excluded.name,
            type=excluded.type,
@@ -53,7 +55,8 @@ export class NodeSqliteFtsGraphStore implements GraphStore {
            confidence=excluded.confidence,
            updated_at=excluded.updated_at,
            external_refs=excluded.external_refs,
-           file_path=excluded.file_path`
+           file_path=excluded.file_path,
+           normalized_name=excluded.normalized_name`
       )
       .run(
         entity.id,
@@ -64,12 +67,13 @@ export class NodeSqliteFtsGraphStore implements GraphStore {
         entity.createdAt,
         entity.updatedAt,
         JSON.stringify(entity.externalRefs ?? {}),
-        entity.filePath ?? null
+        entity.filePath ?? null,
+        normalizeComparableText(entity.name)
       );
 
     this.database.prepare("DELETE FROM aliases WHERE entity_id = ?").run(entity.id);
     for (const alias of entity.aliases) {
-      this.database.prepare("INSERT OR IGNORE INTO aliases(entity_id, alias) VALUES (?, ?)").run(entity.id, alias);
+      this.database.prepare("INSERT OR IGNORE INTO aliases(entity_id, alias, normalized_alias) VALUES (?, ?, ?)").run(entity.id, alias, normalizeComparableText(alias));
     }
 
     this.database.prepare("DELETE FROM tags WHERE owner_kind = 'entity' AND owner_id = ?").run(entity.id);
@@ -119,15 +123,16 @@ export class NodeSqliteFtsGraphStore implements GraphStore {
   async upsertEpisode(episode: Episode): Promise<void> {
     this.database
       .prepare(
-        `INSERT INTO episodes(id, title, text, summary, source_id, created_at, updated_at, file_path)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO episodes(id, title, text, summary, source_id, created_at, updated_at, file_path, normalized_text_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            title=excluded.title,
            text=excluded.text,
            summary=excluded.summary,
            source_id=excluded.source_id,
            updated_at=excluded.updated_at,
-           file_path=excluded.file_path`
+           file_path=excluded.file_path,
+           normalized_text_hash=excluded.normalized_text_hash`
       )
       .run(
         episode.id,
@@ -137,7 +142,8 @@ export class NodeSqliteFtsGraphStore implements GraphStore {
         episode.sourceId ?? null,
         episode.createdAt,
         episode.updatedAt,
-        episode.filePath ?? null
+        episode.filePath ?? null,
+        normalizedTextHash(episode.text)
       );
 
     this.database.prepare("DELETE FROM entity_episode_refs WHERE episode_id = ?").run(episode.id);
@@ -205,6 +211,83 @@ export class NodeSqliteFtsGraphStore implements GraphStore {
     return { entities, relations, episodes, sources };
   }
 
+  async findEpisodeByText(text: string): Promise<Episode | undefined> {
+    const row =
+      this.database.prepare("SELECT * FROM episodes WHERE normalized_text_hash = ? LIMIT 1").get(normalizedTextHash(text)) ??
+      this.database.prepare("SELECT * FROM episodes WHERE text = ? LIMIT 1").get(text);
+    return row ? this.episodeFromRow(row) : undefined;
+  }
+
+  async findEntitiesByIds(ids: string[]): Promise<Entity[]> {
+    const entities: Entity[] = [];
+    for (const id of ids) {
+      const entity = this.readEntity(id);
+      if (entity) entities.push(entity);
+    }
+    return entities;
+  }
+
+  async findEntityCandidates(input: { name: string; aliases?: string[]; type?: Entity["type"]; limit?: number }): Promise<Entity[]> {
+    const limit = Math.max(1, input.limit ?? 20);
+    const names = uniqueNormalized([input.name, ...(input.aliases ?? [])]);
+    const candidates = new Map<string, Entity>();
+
+    for (const name of names) {
+      const rows = this.database
+        .prepare(
+          `SELECT DISTINCT e.*
+           FROM entities e
+           LEFT JOIN aliases a ON a.entity_id = e.id
+           WHERE (e.normalized_name = ? OR a.normalized_alias = ?)
+             AND (? IS NULL OR e.type = ? OR e.type = 'unknown' OR ? = 'unknown')
+           ORDER BY e.updated_at DESC
+           LIMIT ?`
+        )
+        .all(name, name, input.type ?? null, input.type ?? null, input.type ?? null, limit);
+      for (const row of rows) {
+        const entity = this.entityFromRow(row);
+        candidates.set(entity.id, entity);
+      }
+    }
+
+    if (candidates.size < limit) {
+      const matches = await this.search([input.name, ...(input.aliases ?? [])].join(" "), limit);
+      for (const match of matches.filter((item) => item.kind === "entity")) {
+        const entity = this.readEntity(match.id);
+        if (!entity) continue;
+        if (input.type && entity.type !== input.type && entity.type !== "unknown" && input.type !== "unknown") continue;
+        candidates.set(entity.id, entity);
+        if (candidates.size >= limit) break;
+      }
+    }
+
+    return [...candidates.values()].slice(0, limit);
+  }
+
+  async findRelationByTriple(input: { sourceId: string; predicate: string; targetId: string }): Promise<Relation | undefined> {
+    const row = this.database
+      .prepare("SELECT * FROM relations WHERE source_id = ? AND predicate = ? AND target_id = ? LIMIT 1")
+      .get(input.sourceId, input.predicate, input.targetId);
+    return row ? this.relationFromRow(row) : undefined;
+  }
+
+  async findRelationsByEvidenceId(episodeId: string): Promise<Relation[]> {
+    const rows = this.database
+      .prepare(
+        `SELECT r.*
+         FROM relations r
+         INNER JOIN relation_evidence_refs ref ON ref.relation_id = r.id
+         WHERE ref.evidence_id = ?
+         ORDER BY r.updated_at DESC`
+      )
+      .all(episodeId);
+    return rows.map((row) => this.relationFromRow(row));
+  }
+
+  async findSourceById(id: string): Promise<SourceRef | undefined> {
+    return this.readSource(id);
+  }
+
   async rebuild(snapshot: GraphSnapshot): Promise<void> {
     this.database.exec("BEGIN");
     try {
@@ -251,6 +334,44 @@ export class NodeSqliteFtsGraphStore implements GraphStore {
       throw new Error("Graph store is not initialized.");
     }
     return this.db;
+  }
+
+  private ensureSchemaCompatibility(): void {
+    const episodeColumns = new Set(this.database.prepare("PRAGMA table_info(episodes)").all().map((row) => String(row.name)));
+    if (!episodeColumns.has("normalized_text_hash")) {
+      this.database.prepare("ALTER TABLE episodes ADD COLUMN normalized_text_hash TEXT").run();
+    }
+    const entityColumns = new Set(this.database.prepare("PRAGMA table_info(entities)").all().map((row) => String(row.name)));
+    if (!entityColumns.has("normalized_name")) {
+      this.database.prepare("ALTER TABLE entities ADD COLUMN normalized_name TEXT").run();
+    }
+    const aliasColumns = new Set(this.database.prepare("PRAGMA table_info(aliases)").all().map((row) => String(row.name)));
+    if (!aliasColumns.has("normalized_alias")) {
+      this.database.prepare("ALTER TABLE aliases ADD COLUMN normalized_alias TEXT").run();
+    }
+
+    const rows = this.database.prepare("SELECT id, text FROM episodes WHERE normalized_text_hash IS NULL OR normalized_text_hash = ''").all();
+    for (const row of rows) {
+      this.database.prepare("UPDATE episodes SET normalized_text_hash = ? WHERE id = ?").run(normalizedTextHash(String(row.text)), String(row.id));
+    }
+    const entityRows = this.database.prepare("SELECT id, name FROM entities WHERE normalized_name IS NULL OR normalized_name = ''").all();
+    for (const row of entityRows) {
+      this.database.prepare("UPDATE entities SET normalized_name = ? WHERE id = ?").run(normalizeComparableText(String(row.name)), String(row.id));
+    }
+    const aliasRows = this.database.prepare("SELECT entity_id, alias FROM aliases WHERE normalized_alias IS NULL OR normalized_alias = ''").all();
+    for (const row of aliasRows) {
+      this.database
+        .prepare("UPDATE aliases SET normalized_alias = ? WHERE entity_id = ? AND alias = ?")
+        .run(normalizeComparableText(String(row.alias)), String(row.entity_id), String(row.alias));
+    }
+
+    this.database.exec(`
+      CREATE INDEX IF NOT EXISTS idx_episodes_normalized_text_hash ON episodes(normalized_text_hash);
+      CREATE INDEX IF NOT EXISTS idx_entities_normalized_name_type ON entities(normalized_name, type);
+      CREATE INDEX IF NOT EXISTS idx_aliases_normalized_alias ON aliases(normalized_alias);
+      CREATE INDEX IF NOT EXISTS idx_relations_triple ON relations(source_id, predicate, target_id);
+      CREATE INDEX IF NOT EXISTS idx_relation_evidence_refs_evidence_id ON relation_evidence_refs(evidence_id);
+    `);
   }
 
   private async reindexEntity(id: string): Promise<void> {
@@ -452,6 +573,31 @@ function nullableString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+function uniqueNormalized(values: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const value of values) {
+    const normalized = normalizeComparableText(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    unique.push(normalized);
+  }
+  return unique;
+}
+
+function normalizedTextHash(value: string): string {
+  return createHash("sha256").update(normalizeComparableText(value)).digest("hex");
+}
+
+function normalizeComparableText(value: string): string {
+  return value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
 function toFtsQuery(query: string): string {
   return query
     .trim()
@@ -482,12 +628,14 @@ CREATE TABLE IF NOT EXISTS entities (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   external_refs TEXT NOT NULL DEFAULT '{}',
-  file_path TEXT
+  file_path TEXT,
+  normalized_name TEXT
 );
 
 CREATE TABLE IF NOT EXISTS aliases (
   entity_id TEXT NOT NULL,
   alias TEXT NOT NULL,
+  normalized_alias TEXT,
   PRIMARY KEY(entity_id, alias),
   FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE
 );
@@ -519,6 +667,7 @@ CREATE TABLE IF NOT EXISTS episodes (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   file_path TEXT,
+  normalized_text_hash TEXT,
   FOREIGN KEY(source_id) REFERENCES sources(id) ON DELETE SET NULL
 );
 
