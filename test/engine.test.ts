@@ -14,7 +14,7 @@ import {
   type QueryHopDecision,
   type QueryInterpretation
 } from "../src/index.js";
-import { answerPrompt, extractionPrompt, parseRequiredExtraction, queryHopPrompt } from "../src/model/extraction.js";
+import { answerPrompt, extractionPrompt, ingestEntitiesPrompt, parseRequiredExtraction, queryHopPrompt } from "../src/model/extraction.js";
 import { stringifyMarkdownDocument } from "../src/utils/frontmatter.js";
 
 class FakeModelProvider implements ModelProvider {
@@ -309,6 +309,18 @@ test("extraction prompt includes a concrete JSON template and scalar field rules
 
   const rulesBeforeInput = prompt.split("\nInput:\n")[0] ?? "";
   assert.doesNotMatch(rulesBeforeInput, /cashier\.temporary_receipt/);
+});
+
+test("ingest entity prompt ignores temporary PR and commit entities", () => {
+  const prompt = ingestEntitiesPrompt({
+    summary: "PR #123 fixes commit abc123 by squashing before review.",
+    facts: ["PR #123 references commit abc123.", "Squashing before review is useful."]
+  });
+
+  assert.match(prompt, /Ignore temporary entities that are unlikely to be reused long term/);
+  assert.match(prompt, /specific numbered PR, issue, build, run, log entry, branch snapshot, commit hash/);
+  assert.match(prompt, /Do not create entities for generic workflow words such as PR, pull request, commit, branch, or build/);
+  assert.match(prompt, /extract the reusable rule or practice instead of the temporary item itself/);
 });
 
 test("failure experience extraction may contain no durable entities", () => {
