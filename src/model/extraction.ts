@@ -2,13 +2,14 @@ import type { EntityType, ExtractedMemory, MemoryMatch, QueryHopCandidate, Query
 
 export function extractionPrompt(text: string): string {
   const template = {
+    experienceOutcome: "success",
     summary: "One concise sentence summarizing the durable memory.",
     entities: [
       {
-        name: "Exact entity name, for example cashier.temporary_receipt",
+        name: "Meaningful entity name exactly as it appears in the input",
         type: "concept",
-        aliases: ["short alias"],
-        tags: ["short tag"],
+        aliases: ["useful alternative name"],
+        tags: ["stable category"],
         summary: "One concise sentence about this entity.",
         confidence: 0.8,
         externalRefs: {
@@ -31,12 +32,22 @@ export function extractionPrompt(text: string): string {
 
   return [
     "Extract durable agent memory from the input and return only strict JSON.",
-    "Use exactly this top-level shape: summary, entities, relations.",
+    "Use exactly this top-level shape: experienceOutcome, summary, entities, relations.",
+    "First decide whether the input describes a success experience, a failure experience, or an unknown outcome.",
+    "Extract only meaningful, durable entities and relationships that are explicitly stated or strongly implied by the input.",
+    "For success experiences, extract reusable entities and relations that explain what worked, what depends on what, or what should be remembered next time.",
+    "For failure experiences, first analyze whether there are named, durable, reusable entities worth remembering.",
+    "For failure experiences, return entities only for concrete reusable entities such as projects, bugs, files, tables, APIs, tools, commands, decisions, rules, or named concepts.",
+    "For failure experiences, use [] for entities and relations when the failure only describes a transient attempt, vague error, or non-reusable detail.",
+    "Treat best practices, durable preferences, constraints, repeatable procedures, and accepted approaches as rule entities when they can guide future behavior.",
+    "Do not create entities for throwaway labels, internal codenames, arbitrary placeholders, vague pronouns, or incidental words unless they identify a meaningful reusable thing.",
+    "Do not introduce special names, codenames, or examples that are not present in the input.",
     "",
     "JSON template:",
     JSON.stringify(template, null, 2),
     "",
     "Field rules:",
+    "experienceOutcome must be one of success, failure, unknown.",
     "summary must be a string.",
     "entities must be an array. Each entity must include name. Use [] when there are no aliases or tags.",
     "Entity name, summary, aliases, tags, externalRefs values, relation IDs, predicates, and descriptions must be strings.",
@@ -45,7 +56,8 @@ export function extractionPrompt(text: string): string {
     "Use artifact for concrete files, tables, APIs, commands, tools, documents, and other named technical objects.",
     "Preserve database, schema, table, API, file, and command names exactly, including dots and underscores.",
     "relations must be an array. Use sourceId and targetId values that exactly match entity names from entities.",
-    "Use [] for relations when the input only defines one entity or no durable relationship.",
+    "Each relation must connect two meaningful extracted entities and must be directly supported by the input.",
+    "Use [] for relations when the input only defines one entity or no durable meaningful relationship.",
     "Do not answer or explain the input. Do not wrap the JSON in markdown.",
     "",
     "Input:",
@@ -148,7 +160,7 @@ export function parseRequiredExtraction(value: string | undefined): ExtractedMem
   if (!normalized.summary.trim()) {
     throw new Error("LLM memory extraction failed: JSON response is missing a summary.");
   }
-  if (normalized.entities.length === 0) {
+  if (normalized.experienceOutcome !== "failure" && normalized.entities.length === 0) {
     throw new Error("LLM memory extraction failed: JSON response contains no entities.");
   }
 
@@ -204,6 +216,7 @@ export function normalizeExtraction(extraction: ExtractedMemory): ExtractedMemor
   const relations = Array.isArray(extraction.relations) ? extraction.relations : [];
 
   return {
+    experienceOutcome: experienceOutcomeValue(extraction.experienceOutcome),
     summary: textValue(extraction.summary),
     entities: entities
       .map((entity) => ({
@@ -258,6 +271,11 @@ function stringRecord(value: unknown): Record<string, string> | undefined {
 function entityTypeValue(value: unknown): EntityType | undefined {
   const type = textValue(value);
   return isEntityType(type) ? type : undefined;
+}
+
+function experienceOutcomeValue(value: unknown): ExtractedMemory["experienceOutcome"] {
+  const outcome = textValue(value);
+  return outcome === "success" || outcome === "failure" || outcome === "unknown" ? outcome : undefined;
 }
 
 function isEntityType(value: string): value is EntityType {

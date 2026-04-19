@@ -12,7 +12,7 @@ import {
   type QueryHopDecision,
   type QueryInterpretation
 } from "../src/index.js";
-import { answerPrompt, extractionPrompt, queryHopPrompt } from "../src/model/extraction.js";
+import { answerPrompt, extractionPrompt, parseRequiredExtraction, queryHopPrompt } from "../src/model/extraction.js";
 import { stringifyMarkdownDocument } from "../src/utils/frontmatter.js";
 
 class FakeModelProvider implements ModelProvider {
@@ -107,12 +107,55 @@ test("SDK automatically isolates Copilot SDK config without Copilot environment 
 test("extraction prompt includes a concrete JSON template and scalar field rules", () => {
   const prompt = extractionPrompt("etr就是cashier.temporary_receipt表的数据");
 
+  assert.match(prompt, /"experienceOutcome": "success"/);
   assert.match(prompt, /"summary": "One concise sentence summarizing the durable memory."/);
+  assert.match(prompt, /"name": "Meaningful entity name exactly as it appears in the input"/);
   assert.match(prompt, /"entities": \[/);
   assert.match(prompt, /"relations": \[/);
+  assert.match(prompt, /First decide whether the input describes a success experience, a failure experience, or an unknown outcome/);
+  assert.match(prompt, /Extract only meaningful, durable entities and relationships/);
+  assert.match(prompt, /For failure experiences, first analyze whether there are named, durable, reusable entities worth remembering/);
+  assert.match(prompt, /Treat best practices, durable preferences, constraints, repeatable procedures, and accepted approaches as rule entities/);
+  assert.match(prompt, /Do not create entities for throwaway labels, internal codenames, arbitrary placeholders/);
+  assert.match(prompt, /Do not introduce special names, codenames, or examples that are not present in the input/);
+  assert.match(prompt, /experienceOutcome must be one of success, failure, unknown/);
   assert.match(prompt, /summary must be a string/);
   assert.match(prompt, /Do not return nested objects or arrays inside string fields/);
   assert.match(prompt, /Preserve database, schema, table, API, file, and command names exactly/);
+  assert.match(prompt, /Each relation must connect two meaningful extracted entities and must be directly supported by the input/);
+
+  const rulesBeforeInput = prompt.split("\nInput:\n")[0] ?? "";
+  assert.doesNotMatch(rulesBeforeInput, /cashier\.temporary_receipt/);
+});
+
+test("failure experience extraction may contain no durable entities", () => {
+  const extraction = parseRequiredExtraction(
+    JSON.stringify({
+      experienceOutcome: "failure",
+      summary: "The attempted fix did not resolve the issue.",
+      entities: [],
+      relations: []
+    })
+  );
+
+  assert.equal(extraction.experienceOutcome, "failure");
+  assert.equal(extraction.entities.length, 0);
+  assert.equal(extraction.relations.length, 0);
+});
+
+test("success experience extraction still requires durable entities", () => {
+  assert.throws(
+    () =>
+      parseRequiredExtraction(
+        JSON.stringify({
+          experienceOutcome: "success",
+          summary: "The fix resolved the login issue.",
+          entities: [],
+          relations: []
+        })
+      ),
+    /contains no entities/
+  );
 });
 
 test("answer prompt asks for concise non-enumerated replies", () => {

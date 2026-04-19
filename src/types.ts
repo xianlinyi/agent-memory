@@ -63,6 +63,7 @@ export interface SourceRef {
 }
 
 export interface ExtractedMemory {
+  experienceOutcome?: "success" | "failure" | "unknown";
   summary: string;
   entities: Array<Partial<Entity> & Pick<Entity, "name">>;
   relations: Array<Pick<Relation, "sourceId" | "targetId" | "predicate"> & Partial<Relation>>;
