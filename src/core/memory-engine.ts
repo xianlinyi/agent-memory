@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
-import { defaultConfig, loadConfig, writeConfig } from "../config.js";
+import { applyAutomaticCopilotIsolation, defaultConfig, loadConfig, writeConfig } from "../config.js";
 import { normalizeExtraction } from "../model/extraction.js";
 import { createModelProvider } from "../model/model-factory.js";
 import type { ModelProvider } from "../model/model-provider.js";
@@ -54,7 +54,8 @@ export class MemoryEngine {
   ) {}
 
   static async create(options: MemoryEngineOptions): Promise<MemoryEngine> {
-    const config = options.config ?? (await loadConfig(options.vaultPath));
+    const loadedConfig = options.config ?? (await loadConfig(options.vaultPath));
+    const config = options.modelProvider ? loadedConfig : await applyAutomaticCopilotIsolation(loadedConfig);
     const modelProvider = options.modelProvider ?? createModelProvider(config);
     const graphStore =
       options.graphStore ??

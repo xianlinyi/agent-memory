@@ -152,6 +152,7 @@ export interface AgentMemoryConfig {
     cliArgs?: string[];
     cwd?: string;
     configDir?: string;
+    traceDir?: string;
     githubToken?: string;
     useLoggedInUser?: boolean;
     logLevel?: "none" | "error" | "warning" | "info" | "debug" | "all";

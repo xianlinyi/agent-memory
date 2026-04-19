@@ -1,5 +1,7 @@
+import { mkdir, appendFile } from "node:fs/promises";
+import { join } from "node:path";
 import { approveAll, CopilotClient } from "@github/copilot-sdk";
-import type { CopilotClientOptions, SessionConfig } from "@github/copilot-sdk";
+import type { CopilotClientOptions, CopilotSession, SessionConfig } from "@github/copilot-sdk";
 import type { ExtractedMemory, MemoryMatch, QueryHopCandidate, QueryHopDecision, QueryInterpretation } from "../types.js";
 import {
   answerPrompt,
@@ -22,6 +24,7 @@ export interface CopilotSdkModelProviderOptions {
   cliArgs?: string[];
   cwd?: string;
   configDir?: string;
+  traceDir?: string;
   githubToken?: string;
   useLoggedInUser?: boolean;
   logLevel?: CopilotClientOptions["logLevel"];
@@ -121,12 +124,37 @@ export class CopilotSdkModelProvider implements ModelProvider {
   private async ask(prompt: string): Promise<string | undefined> {
     const client = await this.getClient();
     const session = await client.createSession(this.sessionConfig());
+    const trace = this.createTrace(session);
+    const unsubscribe = session.on((event) => {
+      void trace.write("event", { eventType: event.type, event });
+    });
     try {
+      await trace.write("session.created", {
+        sessionId: session.sessionId,
+        workspacePath: session.workspacePath,
+        model: this.options.model,
+        reasoningEffort: this.options.reasoningEffort,
+        configDir: this.options.configDir,
+        cwd: this.options.cwd
+      });
+      await trace.write("prompt", { prompt });
       const response = await session.sendAndWait({ prompt }, this.options.timeoutMs);
-      return response?.data.content?.trim();
+      const output = response?.data.content?.trim();
+      await trace.write("response", { output, response });
+      return output;
+    } catch (error) {
+      await trace.write("error", { message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack : undefined });
+      throw error;
     } finally {
-      await session.disconnect().catch(() => undefined);
+      unsubscribe();
+      await session.disconnect().catch((error) => trace.write("disconnect.error", { message: error instanceof Error ? error.message : String(error) }));
+      await trace.write("session.disconnected", { sessionId: session.sessionId });
     }
+  }
+
+  private createTrace(session: CopilotSession): CopilotTrace {
+    if (!this.options.traceDir) return new NoopCopilotTrace();
+    return new FileCopilotTrace(this.options.traceDir, session.sessionId);
   }
 
   private async getClient(): Promise<CopilotClient> {
@@ -159,6 +187,64 @@ export class CopilotSdkModelProvider implements ModelProvider {
       workingDirectory: this.options.cwd
     });
   }
+}
+
+interface TraceRecord {
+  timestamp: string;
+  sessionId: string;
+  type: string;
+  data: unknown;
+}
+
+interface CopilotTrace {
+  write(type: string, data: unknown): Promise<void>;
+}
+
+class NoopCopilotTrace implements CopilotTrace {
+  async write(): Promise<void> {}
+}
+
+class FileCopilotTrace implements CopilotTrace {
+  private readonly filePath: string;
+  private pending: Promise<void> = Promise.resolve();
+
+  constructor(
+    private readonly traceDir: string,
+    private readonly sessionId: string
+  ) {
+    this.filePath = join(traceDir, `${safeFileName(sessionId)}.jsonl`);
+  }
+
+  async write(type: string, data: unknown): Promise<void> {
+    const record: TraceRecord = {
+      timestamp: new Date().toISOString(),
+      sessionId: this.sessionId,
+      type,
+      data: normalizeTraceData(data)
+    };
+    const line = `${JSON.stringify(record)}\n`;
+    this.pending = this.pending
+      .then(async () => {
+        await mkdir(this.traceDir, { recursive: true });
+        await appendFile(this.filePath, line, "utf8");
+      })
+      .catch(() => undefined);
+    await this.pending;
+  }
+}
+
+function safeFileName(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]/g, "_") || "session";
+}
+
+function normalizeTraceData(value: unknown): unknown {
+  return JSON.parse(
+    JSON.stringify(value, (_key, item) => {
+      if (typeof item === "bigint") return item.toString();
+      if (item instanceof Error) return { message: item.message, stack: item.stack };
+      return item;
+    })
+  ) as unknown;
 }
 
 function stripUndefined<T extends Record<string, unknown>>(value: T): T {

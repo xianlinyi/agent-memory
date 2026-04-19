@@ -1,6 +1,6 @@
 {
   "name": "@xianlinyi/agent-memory",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "External agent memory layer backed by Obsidian Markdown and SQLite FTS5.",
   "type": "module",
   "bin": {

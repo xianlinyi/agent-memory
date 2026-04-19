@@ -174,7 +174,7 @@ Vault configuration lives in `.kg/config.json`:
     "provider": "copilot-sdk",
     "model": "gpt-5-mini",
     "reasoningEffort": "medium",
-    "timeoutMs": 30000
+    "timeoutMs": 600000
   }
 }
 ```
@@ -184,11 +184,23 @@ Update it through the CLI:
 ```bash
 agent-memory config set model.model gpt-5-mini --vault ./memory-vault
 agent-memory config set model.reasoningEffort medium --vault ./memory-vault
-agent-memory config set model.timeoutMs 30000 --vault ./memory-vault
+agent-memory config set model.timeoutMs 600000 --vault ./memory-vault
 agent-memory config get model --vault ./memory-vault --json
 ```
 
-Optional Copilot SDK fields include `model.cliPath`, `model.cliUrl`, `model.cliArgs`, `model.cwd`, `model.configDir`, `model.githubToken`, `model.useLoggedInUser`, and `model.logLevel`.
+Optional Copilot SDK fields include `model.cliPath`, `model.cliUrl`, `model.cliArgs`, `model.cwd`, `model.configDir`, `model.traceDir`, `model.githubToken`, `model.useLoggedInUser`, and `model.logLevel`.
+
+When `agent-memory` uses the `copilot-sdk` provider, it automatically isolates its Copilot runtime so nested model calls do not load local hook plugins. It creates `<vault>/.kg/copilot-isolated/config.json` with hooks disabled and no installed plugins, then uses that directory for the Copilot SDK session. This applies to both the CLI and the TypeScript SDK unless `model.configDir` is already set.
+
+You can also prepare or pin the isolated config explicitly:
+
+```bash
+agent-memory copilot isolate --vault ./memory-vault
+```
+
+Use `--config-dir <path>` if you want the isolated Copilot config elsewhere. Set `AGENT_MEMORY_AUTO_COPILOT_ISOLATE=0` to opt out of automatic isolation.
+
+Copilot SDK calls are traced to `<vault>/.kg/copilot-runs/<session-id>.jsonl` by default. Set `model.traceDir` to a custom directory, or to an empty string to disable trace files.
 
 The legacy `copilot-cli` provider is still available:
 

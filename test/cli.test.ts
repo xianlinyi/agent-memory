@@ -20,8 +20,9 @@ test("cli init and doctor produce machine-readable output", async () => {
     assert.equal(initJson.configPath, join(vaultPath, ".kg", "config.json"));
     await access(join(vaultPath, ".kg", "graph.db"));
     await access(join(vaultPath, ".kg", "config.json"));
-    const persisted = JSON.parse(await readFile(join(vaultPath, ".kg", "config.json"), "utf8")) as { model: { model: string } };
+    const persisted = JSON.parse(await readFile(join(vaultPath, ".kg", "config.json"), "utf8")) as { model: { model: string; timeoutMs: number } };
     assert.equal(persisted.model.model, "gpt-5-mini");
+    assert.equal(persisted.model.timeoutMs, 600000);
 
     const doctor = await execFileAsync(process.execPath, [cliPath, "doctor", "--vault", vaultPath, "--json"]);
     const checks = JSON.parse(doctor.stdout) as Array<{ name: string; ok: boolean }>;
@@ -53,6 +54,108 @@ test("cli config set and get updates vault config", async () => {
     assert.equal(persisted.model.timeoutMs, 12345);
   } finally {
     await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
+test("cli copilot isolate writes a hook-free config dir and updates vault config", async () => {
+  const rootPath = await mkdtemp(join(tmpdir(), "agent-memory-copilot-isolate-"));
+  const vaultPath = join(rootPath, "Vault");
+  const sourceConfigPath = join(rootPath, "source-copilot-config.json");
+  const isolatedConfigDir = join(rootPath, "isolated-copilot");
+  const env = { ...process.env, AGENT_MEMORY_COPILOT_SOURCE_CONFIG: sourceConfigPath };
+
+  try {
+    await execFileAsync(process.execPath, [
+      "-e",
+      `
+const fs = require("node:fs");
+fs.writeFileSync(process.argv[1], JSON.stringify({
+  firstLaunchAt: "2026-04-18T00:00:00.000Z",
+  lastLoggedInUser: { host: "https://github.com", login: "octo" },
+  loggedInUsers: [{ host: "https://github.com", login: "octo" }],
+  model: "gpt-5-mini",
+  installedPlugins: [{ name: "memory-hook", enabled: true }],
+  enabledPlugins: { "memory-hook": true },
+  hooks: { sessionEnd: [{ type: "command", command: "agent-memory ingest" }] }
+}, null, 2));
+`,
+      sourceConfigPath
+    ]);
+
+    const output = await execFileAsync(
+      process.execPath,
+      [cliPath, "copilot", "isolate", "--config-dir", isolatedConfigDir, "--vault", vaultPath, "--json"],
+      { env }
+    );
+    const json = JSON.parse(output.stdout) as { ok: boolean; modelConfigDir: string; configPath: string; copiedFrom: string };
+    assert.equal(json.ok, true);
+    assert.equal(json.modelConfigDir, isolatedConfigDir);
+    assert.equal(json.configPath, join(isolatedConfigDir, "config.json"));
+    assert.equal(json.copiedFrom, sourceConfigPath);
+
+    const copilotConfig = JSON.parse(await readFile(join(isolatedConfigDir, "config.json"), "utf8")) as {
+      disableAllHooks: boolean;
+      hooks: Record<string, unknown>;
+      installedPlugins: unknown[];
+      enabledPlugins: Record<string, unknown>;
+      lastLoggedInUser?: { login: string };
+    };
+    assert.equal(copilotConfig.disableAllHooks, true);
+    assert.deepEqual(copilotConfig.hooks, {});
+    assert.deepEqual(copilotConfig.installedPlugins, []);
+    assert.deepEqual(copilotConfig.enabledPlugins, {});
+    assert.equal(copilotConfig.lastLoggedInUser?.login, "octo");
+
+    const vaultConfig = JSON.parse(await readFile(join(vaultPath, ".kg", "config.json"), "utf8")) as { model: { configDir: string } };
+    assert.equal(vaultConfig.model.configDir, isolatedConfigDir);
+  } finally {
+    await rm(rootPath, { recursive: true, force: true });
+  }
+});
+
+test("cli automatically isolates Copilot config when running inside Copilot", async () => {
+  const rootPath = await mkdtemp(join(tmpdir(), "agent-memory-auto-copilot-isolate-"));
+  const vaultPath = join(rootPath, "Vault");
+  const homePath = join(rootPath, "home");
+  const sourceConfigPath = join(rootPath, "source-copilot-config.json");
+  const env = {
+    ...process.env,
+    HOME: homePath,
+    COPILOT_CLI: "1",
+    AGENT_MEMORY_COPILOT_SOURCE_CONFIG: sourceConfigPath
+  };
+
+  try {
+    await execFileAsync(process.execPath, [
+      "-e",
+      `
+const fs = require("node:fs");
+fs.mkdirSync(require("node:path").dirname(process.argv[1]), { recursive: true });
+fs.writeFileSync(process.argv[1], JSON.stringify({
+  lastLoggedInUser: { host: "https://github.com", login: "octo" },
+  loggedInUsers: [{ host: "https://github.com", login: "octo" }],
+  model: "gpt-5-mini",
+  installedPlugins: [{ name: "memory-hook", enabled: true }]
+}, null, 2));
+`,
+      sourceConfigPath
+    ]);
+
+    await execFileAsync(process.execPath, [cliPath, "init", "--vault", vaultPath, "--json"], { env });
+
+    const vaultConfig = JSON.parse(await readFile(join(vaultPath, ".kg", "config.json"), "utf8")) as { model: { configDir: string } };
+    assert.equal(vaultConfig.model.configDir, join(vaultPath, ".kg", "copilot-isolated"));
+
+    const copilotConfig = JSON.parse(await readFile(join(vaultConfig.model.configDir, "config.json"), "utf8")) as {
+      disableAllHooks: boolean;
+      installedPlugins: unknown[];
+      lastLoggedInUser?: { login: string };
+    };
+    assert.equal(copilotConfig.disableAllHooks, true);
+    assert.deepEqual(copilotConfig.installedPlugins, []);
+    assert.equal(copilotConfig.lastLoggedInUser?.login, "octo");
+  } finally {
+    await rm(rootPath, { recursive: true, force: true });
   }
 });
 

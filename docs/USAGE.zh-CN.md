@@ -390,7 +390,7 @@ memory-vault/.kg/config.json
   "model": {
     "provider": "copilot-sdk",
     "model": "gpt-5-mini",
-    "timeoutMs": 30000
+    "timeoutMs": 600000
   }
 }
 ```
@@ -401,7 +401,7 @@ memory-vault/.kg/config.json
 agent-memory config get model --vault ./memory-vault --json
 agent-memory config set model.model gpt-5-mini --vault ./memory-vault
 agent-memory config set model.reasoningEffort medium --vault ./memory-vault
-agent-memory config set model.timeoutMs 30000 --vault ./memory-vault
+agent-memory config set model.timeoutMs 600000 --vault ./memory-vault
 agent-memory config unset model.reasoningEffort --vault ./memory-vault
 ```
 
@@ -412,9 +412,22 @@ Copilot SDK 可选字段：
 - `model.cliArgs`
 - `model.cwd`
 - `model.configDir`
+- `model.traceDir`
 - `model.githubToken`
 - `model.useLoggedInUser`
 - `model.logLevel`
+
+当 `agent-memory` 使用 `copilot-sdk` provider 时，它会自动使用隔离的 Copilot 配置目录，避免嵌套模型调用加载本地 hook 插件。默认会创建 `<vault>/.kg/copilot-isolated/config.json`，其中禁用 hooks 且不安装插件，然后让 Copilot SDK session 使用该目录。CLI 和 TypeScript SDK 都会生效；如果已经显式设置了 `model.configDir`，则尊重用户配置。
+
+也可以显式预先创建或固定这个隔离配置：
+
+```bash
+agent-memory copilot isolate --vault ./memory-vault
+```
+
+需要自定义目录时可以加 `--config-dir <path>`。如果确实要关闭自动隔离，可以设置 `AGENT_MEMORY_AUTO_COPILOT_ISOLATE=0`。
+
+Copilot SDK 调用默认会 trace 到 `<vault>/.kg/copilot-runs/<session-id>.jsonl`。可以通过 `model.traceDir` 指定其他目录；设置为空字符串可以关闭 trace 文件。
 
 旧的 `copilot-cli` provider 仍可用：
 

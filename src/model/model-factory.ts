@@ -1,4 +1,5 @@
 import type { AgentMemoryConfig } from "../types.js";
+import { defaultCopilotTraceDir } from "../config.js";
 import { CopilotCliModelProvider } from "./copilot-cli-provider.js";
 import { CopilotSdkModelProvider } from "./copilot-sdk-provider.js";
 import type { ModelProvider } from "./model-provider.js";
@@ -22,6 +23,7 @@ export function createModelProvider(config: AgentMemoryConfig): ModelProvider {
     cliArgs: config.model.cliArgs,
     cwd: config.model.cwd,
     configDir: config.model.configDir,
+    traceDir: config.model.traceDir ?? defaultCopilotTraceDir(config.vaultPath),
     githubToken: config.model.githubToken,
     useLoggedInUser: config.model.useLoggedInUser,
     logLevel: config.model.logLevel

@@ -73,6 +73,29 @@ function stripMarkdownExtension(filePath: string): string {
   return filePath.endsWith(".md") ? filePath.slice(0, -3) : filePath;
 }
 
+test("SDK automatically isolates Copilot SDK config without Copilot environment variables", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-sdk-isolate-"));
+  try {
+    const engine = await MemoryEngine.create({ vaultPath });
+    try {
+      assert.equal(engine.config.model.provider, "copilot-sdk");
+      assert.equal(engine.config.model.configDir, join(vaultPath, ".kg", "copilot-isolated"));
+      const isolatedConfig = JSON.parse(await readFile(join(vaultPath, ".kg", "copilot-isolated", "config.json"), "utf8")) as {
+        disableAllHooks: boolean;
+        installedPlugins: unknown[];
+        enabledPlugins: Record<string, unknown>;
+      };
+      assert.equal(isolatedConfig.disableAllHooks, true);
+      assert.deepEqual(isolatedConfig.installedPlugins, []);
+      assert.deepEqual(isolatedConfig.enabledPlugins, {});
+    } finally {
+      await engine.close();
+    }
+  } finally {
+    await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
 test("extraction prompt includes a concrete JSON template and scalar field rules", () => {
   const prompt = extractionPrompt("etr就是cashier.temporary_receipt表的数据");
 

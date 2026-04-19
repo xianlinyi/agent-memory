@@ -2,7 +2,16 @@
 import { writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { MemoryEngine, textOrFile } from "../index.js";
-import { configPath, defaultVaultPath, loadConfig, loadUserConfig, USER_CONFIG_FILE, writeConfig, writeUserConfig } from "../config.js";
+import {
+  configPath,
+  defaultVaultPath,
+  loadConfig,
+  loadUserConfig,
+  prepareCopilotIsolatedConfig,
+  USER_CONFIG_FILE,
+  writeConfig,
+  writeUserConfig
+} from "../config.js";
 import { MemoryEngineExecutor } from "../core/engine-executor.js";
 import type { AgentMemoryConfig, MemoryMatch, QueryProgressEvent, QueryResult } from "../types.js";
 import type { GraphSnapshot } from "../types.js";
@@ -50,6 +59,11 @@ async function main(): Promise<void> {
     await logger.debug(`command=${command} vault=${vaultPath}`);
     if (command === "config") {
       await handleConfig(vaultPath, parsed);
+      return;
+    }
+
+    if (command === "copilot") {
+      await handleCopilot(vaultPath, parsed);
       return;
     }
 
@@ -244,6 +258,26 @@ async function handleConfig(vaultPath: string, parsed: ParsedArgs): Promise<void
     }
     default:
       throw new Error(`Unknown config action: ${action}`);
+  }
+}
+
+async function handleCopilot(vaultPath: string, parsed: ParsedArgs): Promise<void> {
+  const [action] = parsed.positionals;
+  switch (action) {
+    case "isolate": {
+      const isolated = await prepareCopilotIsolatedConfig(vaultPath, stringFlag(parsed, "config-dir"));
+      const config = await loadConfig(vaultPath);
+      config.model.configDir = isolated.configDir;
+      await writeConfig(config);
+      printJsonOrText(
+        parsed,
+        { ok: true, vaultPath: config.vaultPath, modelConfigDir: isolated.configDir, configPath: isolated.configPath, copiedFrom: isolated.copiedFrom },
+        `Copilot hooks isolated for ${config.vaultPath}; model.configDir = ${isolated.configDir}`
+      );
+      return;
+    }
+    default:
+      throw new Error(`Unknown copilot action: ${action ?? "<missing>"}`);
   }
 }
 
@@ -614,6 +648,7 @@ function assertConfigKey(key: string): void {
     "model.cliArgs",
     "model.cwd",
     "model.configDir",
+    "model.traceDir",
     "model.githubToken",
     "model.useLoggedInUser",
     "model.logLevel",
@@ -680,6 +715,7 @@ Usage:
   agent-memory config get [key] [--json] [--vault <path>]
   agent-memory config set <key> <value> [--json] [--vault <path>]
   agent-memory config unset <key> [--json] [--vault <path>]
+  agent-memory copilot isolate [--config-dir <path>] [--json] [--vault <path>]
 
 Global flags:
   --verbose                 Write progress logs to stderr.
