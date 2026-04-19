@@ -67,6 +67,7 @@ export interface ExtractedMemory {
   summary: string;
   successExperience?: string;
   hasExplicitRelationOrBehaviorPath?: boolean;
+  hasExplicitConceptSpecification?: boolean;
   entities: Array<Partial<Entity> & Pick<Entity, "name">>;
   relations: Array<Pick<Relation, "sourceId" | "targetId" | "predicate"> & Partial<Relation>>;
 }
@@ -202,6 +203,16 @@ export interface IngestInput {
     label?: string;
     uri?: string;
   };
+  onProgress?: (event: IngestProgressEvent) => void | Promise<void>;
+}
+
+export interface IngestProgressEvent {
+  stage: string;
+  durationMs: number;
+  totalMs: number;
+  input?: unknown;
+  output?: unknown;
+  details?: Record<string, unknown>;
 }
 
 export interface QueryInput {

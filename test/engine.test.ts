@@ -211,6 +211,51 @@ class CacheWorkflowModelProvider extends FakeModelProvider {
   }
 }
 
+class ConceptSpecificationModelProvider extends FakeModelProvider {
+  readonly sessionSteps: string[][] = [];
+
+  async startIngestSession(): Promise<IngestModelSession> {
+    const steps: string[] = [];
+    this.sessionSteps.push(steps);
+    const keyInformation: IngestKeyInformation = {
+      summary: "ETR is the cashier temporary receipt table.",
+      facts: ["ETR maps to the cashier temporary receipt table."]
+    };
+    const extraction: ExtractedMemory = {
+      summary: keyInformation.summary,
+      hasExplicitRelationOrBehaviorPath: false,
+      hasExplicitConceptSpecification: true,
+      entities: [
+        { name: "ETR", type: "concept", aliases: [], tags: ["term"], confidence: 0.9 },
+        { name: "cashier temporary receipt table", type: "artifact", aliases: [], tags: ["table"], confidence: 0.9 }
+      ],
+      relations: [{ sourceId: "ETR", targetId: "cashier temporary receipt table", predicate: "maps_to", description: "ETR maps to the cashier temporary receipt table." }]
+    };
+
+    return {
+      extractKeyInformation: async () => {
+        steps.push("key");
+        return keyInformation;
+      },
+      extractEntitiesAndRelations: async () => {
+        steps.push("entities");
+        return extraction;
+      },
+      classifyOutcomeAndExtractSuccess: async () => {
+        steps.push("outcome");
+        throw new Error("concept specifications should not be classified as success or failure");
+      },
+      reviewIngestMemory: async () => {
+        steps.push("review");
+        return { action: "store", replaceEntityIds: [], replaceRelationIds: [], reason: "explicit concept specification" };
+      },
+      close: async () => {
+        steps.push("close");
+      }
+    };
+  }
+}
+
 function stripMarkdownExtension(filePath: string): string {
   return filePath.endsWith(".md") ? filePath.slice(0, -3) : filePath;
 }
@@ -249,7 +294,8 @@ test("extraction prompt includes a concrete JSON template and scalar field rules
   assert.match(prompt, /"relations": \[/);
   assert.match(prompt, /Step 1: extract the key information from the input/);
   assert.match(prompt, /Step 2: strictly decide whether the key information contains meaningful, durable entities/);
-  assert.match(prompt, /Step 3: decide whether the key information is essentially a successful behavior, a failed behavior, or unknown/);
+  assert.match(prompt, /Step 3: only decide success or failure for experience behavior or behavior paths/);
+  assert.match(prompt, /set hasExplicitConceptSpecification to true and preserve it for storage without judging success or failure/);
   assert.match(prompt, /successExperience as a public, reusable path or practice/);
   assert.match(prompt, /Treat best practices, durable preferences, constraints, repeatable procedures, and accepted approaches as rule entities/);
   assert.match(prompt, /Do not create entities for throwaway labels, internal codenames, arbitrary placeholders/);
@@ -425,6 +471,26 @@ test("ingest caches unconfirmed paths until similar observations reach rank five
       "key,entities,close",
       "key,entities,outcome,review,close"
     ]);
+  } finally {
+    await engine.close();
+    await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
+test("ingest skips outcome classification for explicit concept specifications", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-concept-spec-"));
+  const model = new ConceptSpecificationModelProvider();
+  const engine = await MemoryEngine.create({ vaultPath, modelProvider: model });
+
+  try {
+    await engine.init();
+    const result = await engine.ingest({ text: "ETR is the cashier temporary receipt table." });
+    const snapshot = await engine.export();
+
+    assert.equal(result.meta.status, "created");
+    assert.equal(snapshot.entities.length, 2);
+    assert.equal(snapshot.relations.length, 1);
+    assert.deepEqual(model.sessionSteps, [["key", "entities", "review", "close"]]);
   } finally {
     await engine.close();
     await rm(vaultPath, { recursive: true, force: true });
