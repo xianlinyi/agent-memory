@@ -99,6 +99,8 @@ agent-memory import <export.json> [--vault <path>]
 agent-memory export [--format json|markdown] [--out <path>] [--vault <path>]
 agent-memory doctor [--model] [--json] [--vault <path>]
 agent-memory status [--json] [--vault <path>]
+agent-memory version [--json]
+agent-memory upgrade [--tag <tag>] [--dry-run] [--json]
 agent-memory default get [--json]
 agent-memory default set <vault-path> [--json]
 agent-memory default unset [--json]
@@ -113,6 +115,21 @@ agent-memory config unset <key> [--json] [--vault <path>]
 - `--log-file <path>`: 把进度日志追加写入文件。
 
 交互式终端中，等待型命令会在 `stderr` 显示 spinner。机器可读输出写到 `stdout`；脚本捕获输出时 spinner 会关闭，所以 `--json` 的 stdout 可以直接解析。
+
+检查当前安装版本：
+
+```bash
+agent-memory version
+agent-memory version --json
+```
+
+升级全局安装的 CLI 包：
+
+```bash
+agent-memory upgrade
+agent-memory upgrade --tag latest
+agent-memory upgrade --dry-run
+```
 
 ## 默认 Vault 路径
 

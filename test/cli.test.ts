@@ -9,6 +9,30 @@ import { tmpdir } from "node:os";
 const execFileAsync = promisify(execFile);
 const cliPath = "dist/src/cli/index.js";
 
+test("cli version and upgrade dry-run report package metadata", async () => {
+  const packageJson = JSON.parse(await readFile("package.json", "utf8")) as { name: string; version: string };
+
+  const textVersion = await execFileAsync(process.execPath, [cliPath, "version"]);
+  assert.equal(textVersion.stdout.trim(), packageJson.version);
+
+  const jsonVersion = await execFileAsync(process.execPath, [cliPath, "--version", "--json"]);
+  assert.deepEqual(JSON.parse(jsonVersion.stdout), { name: packageJson.name, version: packageJson.version });
+
+  const upgrade = await execFileAsync(process.execPath, [cliPath, "upgrade", "--dry-run", "--json"]);
+  const upgradeJson = JSON.parse(upgrade.stdout) as {
+    ok: boolean;
+    dryRun: boolean;
+    packageName: string;
+    currentVersion: string;
+    command: string[];
+  };
+  assert.equal(upgradeJson.ok, true);
+  assert.equal(upgradeJson.dryRun, true);
+  assert.equal(upgradeJson.packageName, packageJson.name);
+  assert.equal(upgradeJson.currentVersion, packageJson.version);
+  assert.deepEqual(upgradeJson.command.slice(-2), ["-g", `${packageJson.name}@latest`]);
+});
+
 test("cli init and doctor produce machine-readable output", async () => {
   const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-cli-"));
   try {

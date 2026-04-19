@@ -67,6 +67,8 @@ agent-memory import <export.json> [--vault <path>]
 agent-memory export [--format json|markdown] [--out <path>] [--vault <path>]
 agent-memory doctor [--model] [--json] [--vault <path>]
 agent-memory status [--json] [--vault <path>]
+agent-memory version [--json]
+agent-memory upgrade [--tag <tag>] [--dry-run] [--json]
 agent-memory default get [--json]
 agent-memory default set <vault-path> [--json]
 agent-memory default unset [--json]
@@ -81,6 +83,21 @@ Global flags:
 - `--log-file <path>`: append progress logs to a file.
 
 Interactive commands show a spinner while waiting. Structured output is written to `stdout`; the spinner and logs use `stderr`, and the spinner is disabled when output is captured by scripts.
+
+Check the installed CLI version:
+
+```bash
+agent-memory version
+agent-memory version --json
+```
+
+Upgrade the globally installed CLI package:
+
+```bash
+agent-memory upgrade
+agent-memory upgrade --tag latest
+agent-memory upgrade --dry-run
+```
 
 ## Query JSON
 
