@@ -33,11 +33,12 @@ export function extractionPrompt(text: string): string {
 
   return [
     "Run the ingest extraction workflow and return only strict JSON.",
-    "Use exactly this top-level shape: experienceOutcome, summary, successExperience, entities, relations.",
+    "Use exactly this top-level shape: experienceOutcome, summary, successExperience, hasExplicitConceptSpecification, entities, relations.",
     "Step 1: extract the key information from the input. The summary must describe only the key information.",
     "Step 2: strictly decide whether the key information contains meaningful, durable entities. If it does not, return [] for entities and relations.",
     "Step 2: when meaningful entities exist, extract only those entities and then extract only their directly supported relationships.",
-    "Step 3: decide whether the key information is essentially a successful behavior, a failed behavior, or unknown.",
+    "Step 3: only decide success or failure for experience behavior or behavior paths.",
+    "Step 3: if the key information is a clear concept definition, concept mapping, classification, name, or artifact specification, set hasExplicitConceptSpecification to true and preserve it for storage without judging success or failure.",
     "Step 3: for failed or unknown behavior, set successExperience to an empty string and do not invent success lessons.",
     "Step 3: for successful behavior, extract successExperience as a public, reusable path or practice. It must not contain specific entity names, aliases, private codenames, project names, table names, API names, file names, user names, or one-off identifiers.",
     "Step 3: successExperience must be generalized enough to guide future work across similar situations.",
@@ -94,6 +95,7 @@ export function ingestEntitiesPrompt(keyInformation: IngestKeyInformation): stri
   const template: ExtractedMemory = {
     summary: "One concise sentence summarizing the key information.",
     hasExplicitRelationOrBehaviorPath: true,
+    hasExplicitConceptSpecification: false,
     entities: [
       {
         name: "Meaningful entity name exactly as stated in the key information",
@@ -119,9 +121,10 @@ export function ingestEntitiesPrompt(keyInformation: IngestKeyInformation): stri
 
   return [
     "Continue the same ingest session. Step 2 is entity and relation extraction from the key information only.",
-    "Return only strict JSON with keys summary, hasExplicitRelationOrBehaviorPath, entities, relations.",
+    "Return only strict JSON with keys summary, hasExplicitRelationOrBehaviorPath, hasExplicitConceptSpecification, entities, relations.",
     "Strictly decide whether the key information contains meaningful, durable entities with practical value.",
     "If there are no meaningful entities, return [] for entities and relations.",
+    "Set hasExplicitConceptSpecification to true when the user explicitly defines, names, maps, classifies, or specifies a meaningful concept or artifact, even if there is no behavior path to judge as success or failure.",
     "Only extract relationships that the user explicitly confirmed, or behavior paths that the user explicitly described.",
     "Set hasExplicitRelationOrBehaviorPath to true only when there is at least one explicitly confirmed relation or explicitly described behavior path.",
     "Do not infer weak relations from co-occurrence. Do not classify success or failure yet.",
@@ -141,19 +144,22 @@ export function ingestOutcomePrompt(input: { keyInformation: IngestKeyInformatio
     summary: "One concise sentence summarizing the key information.",
     successExperience: "Public reusable successful behavior path without specific entity names.",
     hasExplicitRelationOrBehaviorPath: true,
+    hasExplicitConceptSpecification: false,
     entities: [],
     relations: []
   };
 
   return [
-    "Continue the same ingest session. Step 3 is outcome classification and success-experience extraction.",
-    "Return only strict JSON with keys experienceOutcome, summary, successExperience, hasExplicitRelationOrBehaviorPath, entities, relations.",
-    "Decide whether the key information is essentially successful behavior, failed behavior, or unknown.",
+    "Continue the same ingest session. Step 3 is outcome classification and success-experience extraction for experience behavior only.",
+    "Return only strict JSON with keys experienceOutcome, summary, successExperience, hasExplicitRelationOrBehaviorPath, hasExplicitConceptSpecification, entities, relations.",
+    "Only judge success or failure when the key information describes an experience behavior or behavior path.",
+    "Do not judge success or failure for pure concept definitions, concept mappings, classifications, names, or artifact specifications.",
+    "Decide whether the experience behavior is essentially successful behavior, failed behavior, or unknown.",
     "experienceOutcome must be one of success, failure, unknown.",
     "If the outcome is failure or unknown, successExperience must be an empty string.",
     "If the outcome is success, successExperience must be a public, reusable behavior path or practice.",
     "successExperience must not contain specific entity names, aliases, private codenames, project names, table names, API names, file names, user names, or one-off identifiers.",
-    "Preserve the entities and relations from step 2 unless they clearly violate the rules.",
+    "Preserve hasExplicitConceptSpecification, entities, and relations from step 2 unless they clearly violate the rules.",
     "Do not wrap the JSON in markdown.",
     "",
     "JSON template:",
@@ -395,6 +401,7 @@ export function normalizeExtraction(extraction: ExtractedMemory): ExtractedMemor
     summary: textValue(extraction.summary),
     successExperience: optionalTextValue(extraction.successExperience),
     hasExplicitRelationOrBehaviorPath: Boolean(extraction.hasExplicitRelationOrBehaviorPath),
+    hasExplicitConceptSpecification: Boolean(extraction.hasExplicitConceptSpecification),
     entities: entities
       .map((entity) => ({
         name: textValue(entity.name),

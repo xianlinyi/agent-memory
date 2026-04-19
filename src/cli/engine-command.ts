@@ -2,7 +2,7 @@ import { writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { MemoryEngine, textOrFile } from "../index.js";
 import { configPath } from "../config.js";
-import type { IngestResult, MemoryMatch, QueryProgressEvent, QueryResult } from "../types.js";
+import type { IngestProgressEvent, IngestResult, MemoryMatch, QueryProgressEvent, QueryResult } from "../types.js";
 import type { GraphSnapshot } from "../types.js";
 import type { Logger } from "../utils/logger.js";
 import type { ParsedArgs } from "./args.js";
@@ -81,6 +81,9 @@ async function handleIngest(engine: MemoryEngine, parsed: ParsedArgs, logger: Lo
         kind: item.uri ? "file" : "cli",
         label: source ?? item.label,
         uri: item.uri
+      },
+      onProgress: async (event) => {
+        await logger.debug(formatIngestProgress(event));
       }
     })
   );
@@ -333,6 +336,14 @@ function formatLogValue(value: unknown): string {
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   if (value === null || value === undefined) return String(value);
   return JSON.stringify(value);
+}
+
+function formatIngestProgress(event: IngestProgressEvent): string {
+  const parts = [`ingest stage=${event.stage}`, `durationMs=${event.durationMs}`, `totalMs=${event.totalMs}`];
+  if (event.details) parts.push(`details=${formatLogValue(event.details)}`);
+  if (event.input !== undefined) parts.push(`input=${formatLogValue(event.input)}`);
+  if (event.output !== undefined) parts.push(`output=${formatLogValue(event.output)}`);
+  return parts.join(" ");
 }
 
 function formatMatchSummary(matches: Awaited<ReturnType<MemoryEngine["query"]>>["matches"]): string {

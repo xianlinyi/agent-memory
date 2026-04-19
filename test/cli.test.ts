@@ -202,6 +202,7 @@ if (input.includes("Review a proposed memory ingest")) {
     summary: "etr represents cashir.temporary_receipt.",
     successExperience: "Preserve exact mappings between domain terms and durable technical artifacts.",
     hasExplicitRelationOrBehaviorPath: true,
+    hasExplicitConceptSpecification: true,
     entities: [
       { name: "etr", type: "concept", summary: "etr is the contents of cashir.temporary_receipt." },
       { name: "cashir.temporary_receipt", type: "artifact", summary: "Temporary receipt table." }
@@ -225,6 +226,7 @@ if (input.includes("Review a proposed memory ingest")) {
   console.log(JSON.stringify({
     summary: "etr represents cashir.temporary_receipt.",
     hasExplicitRelationOrBehaviorPath: true,
+    hasExplicitConceptSpecification: true,
     entities: [
       { name: "etr", type: "concept", summary: "etr is the contents of cashir.temporary_receipt." },
       { name: "cashir.temporary_receipt", type: "artifact", summary: "Temporary receipt table." }

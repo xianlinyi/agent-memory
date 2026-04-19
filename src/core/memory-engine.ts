@@ -16,6 +16,7 @@ import type {
   GraphSnapshot,
   IngestInput,
   IngestKeyInformation,
+  IngestProgressEvent,
   IngestResult,
   IngestReviewDecision,
   MemoryMatch,
@@ -98,7 +99,9 @@ export class MemoryEngine {
   }
 
   async ingest(input: IngestInput): Promise<IngestResult> {
+    const trace = createIngestTracer(input.onProgress);
     await this.ensureReady();
+    await trace("ensureReady");
     const timestamp = nowIso();
     let existingSnapshot: GraphSnapshot | undefined;
     const getExistingSnapshot = async () => {
@@ -142,8 +145,12 @@ export class MemoryEngine {
     let review: IngestReviewDecision | undefined;
     try {
       if (session) {
+        await trace("ingest.step1.input", { input: { text: input.text } });
         keyInformation = await session.extractKeyInformation({ text: input.text });
+        await trace("ingest.step1.output", { output: keyInformation });
+        await trace("ingest.step2.input", { input: { keyInformation } });
         extracted = normalizeExtraction(await session.extractEntitiesAndRelations({ keyInformation }));
+        await trace("ingest.step2.output", { output: extracted });
         if (extracted.entities.length === 0) {
           await session.close?.();
           return {
@@ -153,8 +160,10 @@ export class MemoryEngine {
             meta: ingestMeta("skipped", 0, 0, "no meaningful durable entities")
           };
         }
-        if (!extracted.hasExplicitRelationOrBehaviorPath) {
+        if (!extracted.hasExplicitRelationOrBehaviorPath && !extracted.hasExplicitConceptSpecification) {
+          await trace("ingest.cache.input", { input: { keyInformation, extraction: extracted } });
           const cacheResult = await this.recordIngestCache(keyInformation, extracted, timestamp);
+          await trace("ingest.cache.output", { output: cacheResult });
           if (!cacheResult.promoted) {
             await session.close?.();
             return {
@@ -165,15 +174,23 @@ export class MemoryEngine {
             };
           }
         }
-        extracted = normalizeExtraction(await session.classifyOutcomeAndExtractSuccess({ keyInformation, extraction: extracted }));
+        if (!extracted.hasExplicitConceptSpecification) {
+          await trace("ingest.step3.input", { input: { keyInformation, extraction: extracted } });
+          extracted = normalizeExtraction(await session.classifyOutcomeAndExtractSuccess({ keyInformation, extraction: extracted }));
+          await trace("ingest.step3.output", { output: extracted });
+        } else {
+          await trace("ingest.step3.skipped", { details: { reason: "explicit concept specification" } });
+        }
       } else {
+        await trace("ingest.legacyExtract.input", { input: { text: input.text } });
         extracted = normalizeExtraction(await this.modelProvider.extractMemory({ text: input.text }));
+        await trace("ingest.legacyExtract.output", { output: extracted });
       }
     } catch (error) {
       await session?.close?.();
       throw error;
     }
-    if (extracted.experienceOutcome !== "success") {
+    if (!extracted.hasExplicitConceptSpecification && extracted.experienceOutcome !== "success") {
       await session?.close?.();
       return {
         episode: skippedEpisode(input.text, extracted.summary, timestamp),
@@ -195,14 +212,20 @@ export class MemoryEngine {
     const reviewCandidates = await this.findIngestReviewCandidates(extracted, 5);
     if (session) {
       try {
+        await trace("ingest.step4.input", { input: { extraction: extracted, candidates: reviewCandidates } });
         review = await session.reviewIngestMemory({ extraction: extracted, candidates: reviewCandidates });
+        await trace("ingest.step4.output", { output: review });
       } catch (error) {
         await session.close?.();
         throw error;
       }
       await session.close?.();
     } else {
-      review = this.modelProvider.reviewIngestMemory ? await this.modelProvider.reviewIngestMemory({ extraction: extracted, candidates: reviewCandidates }) : undefined;
+      if (this.modelProvider.reviewIngestMemory) {
+        await trace("ingest.step4.input", { input: { extraction: extracted, candidates: reviewCandidates } });
+        review = await this.modelProvider.reviewIngestMemory({ extraction: extracted, candidates: reviewCandidates });
+        await trace("ingest.step4.output", { output: review });
+      }
     }
     if (review?.successExperience) {
       extracted = { ...extracted, successExperience: review.successExperience };
@@ -225,6 +248,7 @@ export class MemoryEngine {
         ? (await this.graphStore.findRelationsByIds?.(review.replaceRelationIds)) ?? (await getExistingSnapshot()).relations.filter((relation) => review.replaceRelationIds.includes(relation.id))
         : [];
     const source = sourceDraft ? await this.createSource(sourceDraft) : undefined;
+    await trace("ingest.write.start", { details: { entities: extracted.entities.length, relations: extracted.relations.length } });
 
     const entities: Entity[] = [];
     const entityIdByName = new Map<string, string>();
@@ -319,7 +343,9 @@ export class MemoryEngine {
       relations.push(written);
     }
 
-    return { source, episode: writtenEpisode, entities, relations, meta: ingestMeta(entitiesMerged + relationsMerged > 0 ? "merged" : "created", entitiesMerged, relationsMerged) };
+    const result = { source, episode: writtenEpisode, entities, relations, meta: ingestMeta(entitiesMerged + relationsMerged > 0 ? "merged" : "created", entitiesMerged, relationsMerged) };
+    await trace("ingest.write.output", { output: result });
+    return result;
   }
 
   async query(input: QueryInput): Promise<QueryResult> {
@@ -893,6 +919,7 @@ function truncateText(value: string | undefined, maxChars: number): string {
 }
 
 type QueryProgressReporter = (stage: string, details?: Record<string, unknown>) => Promise<void>;
+type IngestProgressReporter = (stage: string, payload?: { input?: unknown; output?: unknown; details?: Record<string, unknown> }) => Promise<void>;
 
 interface IngestCacheEntry {
   id: string;
@@ -952,6 +979,25 @@ function createQueryTracer(onProgress?: QueryInput["onProgress"]): QueryProgress
       durationMs: now - lastAt,
       totalMs: now - startedAt,
       details
+    };
+    lastAt = now;
+    await onProgress(event);
+  };
+}
+
+function createIngestTracer(onProgress?: IngestInput["onProgress"]): IngestProgressReporter {
+  const startedAt = Date.now();
+  let lastAt = startedAt;
+  return async (stage: string, payload?: { input?: unknown; output?: unknown; details?: Record<string, unknown> }) => {
+    if (!onProgress) return;
+    const now = Date.now();
+    const event: IngestProgressEvent = {
+      stage,
+      durationMs: now - lastAt,
+      totalMs: now - startedAt,
+      input: payload?.input,
+      output: payload?.output,
+      details: payload?.details
     };
     lastAt = now;
     await onProgress(event);
