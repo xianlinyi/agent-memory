@@ -81,6 +81,95 @@ class EntityOnlyNavigatingModelProvider extends NavigatingModelProvider {
   }
 }
 
+class WideHopModelProvider extends FakeModelProvider {
+  decisions: Array<{ hop: number; candidates: string[] }> = [];
+
+  async extractMemory(): Promise<ExtractedMemory> {
+    const leaves = Array.from({ length: 8 }, (_, index) => `Leaf ${index + 1}`);
+    return {
+      experienceOutcome: "success",
+      summary: "HubRoot connects to several leaf memories.",
+      successExperience: "Keep graph expansion bounded before synthesizing an answer.",
+      entities: [
+        { name: "HubRoot", type: "concept", summary: "The central entity for bounded hop tests.", aliases: [], tags: [], confidence: 0.9 },
+        ...leaves.map((name) => ({ name, type: "concept" as const, summary: `${name} is connected to HubRoot.`, aliases: [], tags: [], confidence: 0.8 }))
+      ],
+      relations: leaves.map((name, index) => ({
+        sourceId: "HubRoot",
+        targetId: name,
+        predicate: `connects_${index + 1}`,
+        description: `Bounded edge ${index + 1}.`,
+        confidence: 0.8,
+        weight: 1
+      }))
+    };
+  }
+
+  async extractQuery(): Promise<QueryInterpretation> {
+    return {
+      keywords: ["HubRoot"],
+      entities: ["HubRoot"],
+      predicates: [],
+      expandedQuery: "HubRoot"
+    };
+  }
+
+  async decideQueryHop(input: Parameters<NonNullable<ModelProvider["decideQueryHop"]>>[0]): Promise<QueryHopDecision> {
+    this.decisions.push({ hop: input.hop, candidates: input.candidates.map((candidate) => candidate.title) });
+    if (input.hop === 0) {
+      const selected = input.candidates.find((candidate) => candidate.title === "HubRoot") ?? input.candidates[0];
+      return { continue: Boolean(selected), nodeIds: selected ? [selected.id] : [], reason: "Expand the direct hub only." };
+    }
+    return { continue: false, nodeIds: [], reason: "The bounded relations are enough." };
+  }
+}
+
+class PeopleTargetQueryModelProvider extends FakeModelProvider {
+  async extractMemory(): Promise<ExtractedMemory> {
+    return {
+      experienceOutcome: "success",
+      summary: "payment-service PRs are submitted to Ada.",
+      successExperience: "Route service pull requests to the appropriate reviewer.",
+      entities: [
+        { name: "payment-service", type: "project", summary: "Payment service repository.", aliases: [], tags: ["service"], confidence: 0.9 },
+        { name: "Release checklist", type: "artifact", summary: "Checklist for payment-service releases.", aliases: [], tags: ["artifact"], confidence: 0.8 },
+        { name: "Ada Lovelace", type: "person", summary: "Reviewer for payment-service PRs.", aliases: ["Ada"], tags: ["person"], confidence: 0.9 }
+      ],
+      relations: [
+        {
+          sourceId: "payment-service",
+          targetId: "Release checklist",
+          predicate: "uses",
+          description: "payment-service uses the release checklist.",
+          confidence: 0.8,
+          weight: 1
+        },
+        {
+          sourceId: "payment-service",
+          targetId: "Ada Lovelace",
+          predicate: "pr_submitted_to",
+          description: "payment-service PRs are submitted to Ada Lovelace.",
+          confidence: 0.9,
+          weight: 1
+        }
+      ]
+    };
+  }
+
+  async extractQuery(): Promise<QueryInterpretation> {
+    return {
+      keywords: ["payment-service", "pr"],
+      entities: ["payment-service"],
+      predicates: ["提给谁"],
+      expandedQuery: "payment-service pr 提给谁"
+    };
+  }
+
+  async synthesizeAnswer(input: Parameters<ModelProvider["synthesizeAnswer"]>[0]): Promise<string> {
+    return input.matches.some((match) => match.text.includes("Ada Lovelace")) ? "payment-service 的 PR 提给 Ada Lovelace." : "没有足够信息。";
+  }
+}
+
 class CapturingQueryModelProvider extends FakeModelProvider {
   answerMatches: Array<Parameters<ModelProvider["synthesizeAnswer"]>[0]["matches"]> = [];
 
@@ -548,7 +637,7 @@ test("query hop prompt makes graph expansion conservative", () => {
   assert.match(prompt, /at most 3 nodes/);
 });
 
-test("query only sends top related entity and relation matches to the answer model", async () => {
+test("query sends bounded term matches to the answer model but returns compact evidence", async () => {
   const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-query-scope-"));
   const model = new CapturingQueryModelProvider();
   try {
@@ -563,12 +652,14 @@ test("query only sends top related entity and relation matches to the answer mod
       const result = await engine.query({ text: "commit and create pr", limit: 10, maxHops: 0 });
       const answerMatches = model.answerMatches[0] ?? [];
 
-      assert.equal(result.matches.length, answerMatches.length);
-      assert.ok(answerMatches.length <= 5);
+      assert.ok(result.matches.length <= answerMatches.length);
+      assert.ok(answerMatches.length <= 25);
       assert.ok(answerMatches.length > 0);
+      assert.ok(answerMatches.some((match) => match.kind === "entity"));
       assert.ok(answerMatches.every((match) => match.kind === "entity" || match.kind === "relation"));
       assert.ok(answerMatches.every((match) => match.kind !== "episode" && match.kind !== "source"));
       assert.ok(answerMatches.every((match) => match.text.length <= 2012));
+      assert.ok(result.matches.every((match) => match.kind !== "entity"));
     } finally {
       await engine.close();
     }
@@ -648,17 +739,22 @@ test("engine initializes, ingests, queries, links, rebuilds, and exports graph m
     assert.ok(relationMarkdown.includes(`[[${stripMarkdownExtension(ingest.episode.filePath ?? "")}|${ingest.episode.title}]]`));
     assert.doesNotMatch(relationMarkdown, /- episode:/);
 
-    const queryStages: string[] = [];
+    const queryEvents: Array<{ stage: string; details?: Record<string, unknown> }> = [];
     const query = await engine.query({
       text: "Atlas Obsidian",
       limit: 5,
       onProgress: (event) => {
-        queryStages.push(event.stage);
+        queryEvents.push({ stage: event.stage, details: event.details });
       }
     });
+    const queryStages = queryEvents.map((event) => event.stage);
+    const termSearches = queryEvents.filter((event) => event.stage === "graph.search.term");
     assert.equal(query.interpretation.expandedQuery, "Atlas Obsidian memory uses");
     assert.equal(query.answer, "Project Atlas uses Obsidian for memory.");
-    assert.ok(query.matches.some((match) => match.kind === "entity" && match.title === "Project Atlas"));
+    assert.equal(termSearches.length, 5);
+    assert.ok(termSearches.every((event) => event.details?.limit === 2));
+    assert.ok(query.matches.some((match) => match.kind === "relation" && match.title === "uses"));
+    assert.ok(query.matches.every((match) => match.kind !== "entity"));
     assert.ok(queryStages.includes("model.extractQuery"));
     assert.ok(queryStages.includes("graph.search"));
     assert.ok(queryStages.includes("model.synthesizeAnswer"));
@@ -988,7 +1084,7 @@ test("engine uses SQLite duplicate and merge lookups without reading the full va
   }
 });
 
-test("engine lets the model choose graph hops and nodes up to a cap", async () => {
+test("engine expands fixed graph hops without asking the model for hop decisions", async () => {
   const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-hop-test-"));
   const provider = new EntityOnlyNavigatingModelProvider();
   const engine = await MemoryEngine.create({ vaultPath, modelProvider: provider });
@@ -1003,8 +1099,9 @@ test("engine lets the model choose graph hops and nodes up to a cap", async () =
     });
 
     const query = await engine.query({ text: "What does Ada document?", limit: 5, maxHops: 2 });
-    assert.equal(provider.decisions.length, 2);
-    assert.equal(query.traversal?.length, 1);
+    assert.equal(provider.decisions.length, 0);
+    assert.ok((query.traversal?.length ?? 0) >= 1);
+    assert.ok((query.traversal?.length ?? 0) <= 3);
     assert.equal(query.traversal?.[0]?.hop, 1);
     assert.ok(query.traversal?.[0]?.selectedNodeIds.length);
     assert.ok(query.matches.some((match) => match.kind === "relation" && match.title === "documents_in"));
@@ -1014,7 +1111,56 @@ test("engine lets the model choose graph hops and nodes up to a cap", async () =
   }
 });
 
-test("engine skips model graph hops when direct search already returns evidence", async () => {
+test("engine bounds graph expansion per selected entity and returns relation evidence", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-hop-bound-test-"));
+  const provider = new WideHopModelProvider();
+  const engine = await MemoryEngine.create({ vaultPath, modelProvider: provider });
+
+  try {
+    await engine.init();
+    await engine.ingest({ text: "HubRoot connects to eight leaves." });
+
+    const query = await engine.query({ text: "HubRoot", limit: 5, maxHops: 2 });
+    assert.equal(provider.decisions.length, 0);
+    assert.ok(query.matches.length <= 5);
+    assert.ok(query.matches.length > 0);
+    assert.ok(query.matches.every((match) => match.kind === "relation"));
+  } finally {
+    await engine.close();
+    await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
+test("query targets people relations when asking who a PR is submitted to", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-people-target-test-"));
+  const provider = new PeopleTargetQueryModelProvider();
+  const engine = await MemoryEngine.create({ vaultPath, modelProvider: provider });
+
+  try {
+    await engine.init();
+    await engine.ingest({ text: "payment-service PRs are submitted to Ada Lovelace and use the release checklist." });
+
+    const events: Array<{ stage: string; details?: Record<string, unknown> }> = [];
+    const query = await engine.query({
+      text: "payment-service 的 pr 提给谁",
+      maxHops: 1,
+      onProgress: (event) => {
+        events.push({ stage: event.stage, details: event.details });
+      }
+    });
+
+    const extractEvent = events.find((event) => event.stage === "model.extractQuery");
+    assert.deepEqual(extractEvent?.details?.targetEntityTypes, ["person"]);
+    assert.equal(query.matches.length, 1);
+    assert.equal(query.matches[0]?.title, "pr_submitted_to");
+    assert.match(query.answer, /Ada Lovelace/);
+  } finally {
+    await engine.close();
+    await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
+test("engine always runs fixed graph hops when direct search returns evidence", async () => {
   const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-hop-skip-test-"));
   const provider = new NavigatingModelProvider();
   const engine = await MemoryEngine.create({ vaultPath, modelProvider: provider });
@@ -1034,9 +1180,9 @@ test("engine skips model graph hops when direct search already returns evidence"
     });
 
     assert.equal(provider.decisions.length, 0);
-    assert.equal(query.traversal, undefined);
+    assert.ok((query.traversal?.length ?? 0) >= 1);
     assert.ok(query.matches.some((match) => match.kind === "relation" && match.title === "uses"));
-    assert.ok(stages.includes("graph.expand.model.skipped"));
+    assert.ok(stages.includes("graph.expandNodes"));
     assert.ok(!stages.includes("model.decideQueryHop"));
   } finally {
     await engine.close();

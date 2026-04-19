@@ -22,6 +22,7 @@ import type {
   MemoryMatch,
   MemoryStatus,
   QueryHopCandidate,
+  QueryInterpretation,
   QueryInput,
   QueryProgressEvent,
   QueryResult,
@@ -34,9 +35,9 @@ import { importNodeSqlite } from "../utils/node-sqlite.js";
 import { nowIso } from "../utils/time.js";
 import { ObsidianVaultStore, type VaultStore } from "../vault/vault-store.js";
 
-const DEFAULT_MAX_HOPS = 2;
-const MAX_HOPS = 3;
-const MAX_NODES_PER_HOP = 5;
+const FIXED_QUERY_HOPS = 3;
+const MAX_DIRECT_MATCHES_PER_TERM = 2;
+const MAX_RELATIONS_PER_NODE = 5;
 const DEFAULT_QUERY_LIMIT = 5;
 const MAX_QUERY_MATCHES = 5;
 const MAX_MATCH_TEXT_CHARS = 2000;
@@ -353,37 +354,27 @@ export class MemoryEngine {
     await this.ensureReady();
     await trace("ensureReady");
     const limit = normalizeQueryLimit(input.limit);
-    const maxHops = normalizeMaxHops(input.maxHops);
-    await trace("prepare", { limit, maxHops });
+    const maxHops = FIXED_QUERY_HOPS;
+    await trace("prepare", { limit, maxHops, requestedMaxHops: input.maxHops, relationsPerNode: MAX_RELATIONS_PER_NODE });
     const interpretation = await this.modelProvider.extractQuery({ text: input.text });
+    const intent = inferQueryIntent(input.text, interpretation);
     await trace("model.extractQuery", {
-      keywords: interpretation.keywords.length,
-      entities: interpretation.entities.length,
-      predicates: interpretation.predicates.length
+      keywords: interpretation.keywords,
+      entities: interpretation.entities,
+      predicates: interpretation.predicates,
+      searchTerms: querySearchTerms(interpretation),
+      targetEntityTypes: intent.targetEntityTypes
     });
-    const directMatches = normalizeQueryMatches(await this.graphStore.search(interpretation.expandedQuery, limit, { kinds: ["entity", "relation"] }));
-    await trace("graph.search", { matches: directMatches.length });
-    let traversal: QueryTraversalStep[] | undefined;
-    let matches: MemoryMatch[];
-    if (maxHops === 0) {
-      matches = directMatches;
-      await trace("graph.expand.skipped", { reason: "maxHops=0" });
-    } else if (this.modelProvider.decideQueryHop && shouldAskModelForExpansion(directMatches)) {
-      const expanded = await this.expandMatchesWithModel(input.text, interpretation, directMatches, limit, maxHops, trace);
-      matches = normalizeQueryMatches(expanded.matches);
-      traversal = expanded.traversal;
-      await trace("graph.expand.model.complete", { matches: matches.length, hops: traversal.length });
-    } else if (this.modelProvider.decideQueryHop) {
-      matches = directMatches;
-      await trace("graph.expand.model.skipped", { reason: expansionSkipReason(directMatches) });
-    } else {
-      const expanded = await this.expandEntityMatches(directMatches, limit);
-      matches = normalizeQueryMatches(dedupeMatches([...directMatches, ...expanded]).slice(0, limit));
-      await trace("graph.expand.entities", { addedMatches: expanded.length, matches: matches.length });
-    }
+    const directMatches = await this.searchQueryTerms(interpretation, intent, trace);
+    await trace("graph.search", { matches: directMatches.length, perTermLimit: MAX_DIRECT_MATCHES_PER_TERM });
+    const expanded = await this.expandMatchesFixedHops(directMatches, intent, maxHops, trace);
+    const traversal = expanded.traversal;
+    const synthesisMatches = normalizeQueryMatches(dedupeMatches([...expanded.matches, ...directMatches]));
+    await trace("graph.expand.complete", { matches: synthesisMatches.length, hops: traversal.length });
+    const matches = normalizeQueryMatches(selectEvidenceMatches(synthesisMatches));
     let answer = "";
     if (input.synthesize !== false) {
-      answer = await this.modelProvider.synthesizeAnswer({ query: input.text, interpretation, matches: normalizeQueryMatches(matches) });
+      answer = await this.modelProvider.synthesizeAnswer({ query: input.text, interpretation, matches: synthesisMatches });
       await trace("model.synthesizeAnswer", { answerChars: answer.length });
     } else {
       await trace("model.synthesizeAnswer.skipped", { reason: "synthesize=false" });
@@ -549,106 +540,110 @@ export class MemoryEngine {
     return { promoted: false, rank: entry.rank };
   }
 
-  private async expandEntityMatches(matches: Awaited<ReturnType<GraphStore["search"]>>, limit: number): Promise<Awaited<ReturnType<GraphStore["search"]>>> {
-    const expanded: Awaited<ReturnType<GraphStore["search"]>> = [];
-    for (const match of matches.filter((item) => item.kind === "entity")) {
-      const graph = await this.graphStore.graph(match.id);
-      for (const relation of graph.relations.slice(0, limit)) {
-        expanded.push({
-          kind: "relation",
-          id: relation.id,
-          title: relation.predicate,
-          text: relation.description ?? `${relation.sourceId} ${relation.predicate} ${relation.targetId}`,
-          score: Math.max(match.score - 0.1, 0)
-        });
-      }
+  private async searchQueryTerms(interpretation: Awaited<ReturnType<ModelProvider["extractQuery"]>>, intent: QueryIntent, trace?: QueryProgressReporter): Promise<MemoryMatch[]> {
+    const terms = querySearchTerms(interpretation);
+    await trace?.("graph.search.terms", { terms, targetEntityTypes: intent.targetEntityTypes, limitPerTerm: MAX_DIRECT_MATCHES_PER_TERM });
+    const matches: MemoryMatch[] = [];
+    for (const term of terms) {
+      const termMatches = normalizeQueryMatches(await this.graphStore.search(term, MAX_DIRECT_MATCHES_PER_TERM, { kinds: ["entity", "relation"] }), MAX_DIRECT_MATCHES_PER_TERM);
+      await trace?.("graph.search.term", { term, matches: matchLogItems(termMatches), limit: MAX_DIRECT_MATCHES_PER_TERM });
+      matches.push(...termMatches);
     }
-    return expanded;
+    return normalizeQueryMatches(matches);
   }
 
-  private async expandMatchesWithModel(
-    query: string,
-    interpretation: Awaited<ReturnType<ModelProvider["extractQuery"]>>,
+  private async expandMatchesFixedHops(
     directMatches: MemoryMatch[],
-    limit: number,
+    intent: QueryIntent,
     maxHops: number,
     trace?: QueryProgressReporter
   ): Promise<{ matches: MemoryMatch[]; traversal: QueryTraversalStep[] }> {
     const traversal: QueryTraversalStep[] = [];
     const visitedNodeIds = new Set<string>();
-    let matches = [...directMatches];
+    const matches: MemoryMatch[] = [];
     let candidates = entityCandidatesFromMatches(directMatches);
 
     for (let hop = 0; hop < maxHops; hop += 1) {
       const availableCandidates = candidates.filter((candidate) => !visitedNodeIds.has(candidate.id));
-      await trace?.("graph.expand.model.candidates", { hop, candidates: availableCandidates.length });
+      await trace?.("graph.expand.hop.candidates", { hop: hop + 1, candidates: availableCandidates.map(candidateLogItem), relationsPerNode: MAX_RELATIONS_PER_NODE });
       if (availableCandidates.length === 0) break;
 
-      const decision = await this.modelProvider.decideQueryHop?.({
-        query,
-        interpretation,
-        hop,
-        maxHops,
-        matches: matches.slice(0, limit),
-        candidates: availableCandidates,
-        visitedNodeIds: [...visitedNodeIds]
-      });
-      await trace?.("model.decideQueryHop", {
-        hop,
-        continue: Boolean(decision?.continue),
-        selectedNodes: decision?.nodeIds.length ?? 0
-      });
-      if (!decision?.continue) break;
-
-      const candidateIds = new Set(availableCandidates.map((candidate) => candidate.id));
-      const selectedNodeIds = decision.nodeIds
-        .filter((id) => candidateIds.has(id) && !visitedNodeIds.has(id))
-        .slice(0, MAX_NODES_PER_HOP);
-      if (selectedNodeIds.length === 0) break;
-
+      const selectedNodeIds = availableCandidates.map((candidate) => candidate.id);
       for (const nodeId of selectedNodeIds) visitedNodeIds.add(nodeId);
-      const expanded = await this.expandNodes(selectedNodeIds, limit);
+      const expanded = await this.expandNodes(selectedNodeIds, intent);
       await trace?.("graph.expandNodes", {
-        hop,
+        hop: hop + 1,
         selectedNodes: selectedNodeIds.length,
         addedMatches: expanded.matches.length,
-        candidates: expanded.candidates.length
+        candidates: expanded.candidates.length,
+        expandedNodes: expanded.expandedNodes
       });
-      matches = normalizeQueryMatches(dedupeMatches([...matches, ...expanded.matches]).slice(0, limit));
+      matches.push(...expanded.matches);
       traversal.push({
         hop: hop + 1,
-        fromNodeIds: availableCandidates.map((candidate) => candidate.id),
+        fromNodeIds: selectedNodeIds,
         selectedNodeIds,
         addedMatchIds: expanded.matches.map((match) => `${match.kind}:${match.id}`),
-        decisionReason: decision.reason
+        decisionReason: `fixed ${maxHops}-hop expansion`
       });
       candidates = dedupeCandidates(expanded.candidates);
     }
 
-    return { matches, traversal };
+    return { matches: dedupeMeaningfulMatches(matches), traversal };
   }
 
-  private async expandNodes(nodeIds: string[], limit: number): Promise<{ matches: MemoryMatch[]; candidates: QueryHopCandidate[] }> {
+  private async expandNodes(nodeIds: string[], intent: QueryIntent): Promise<{ matches: MemoryMatch[]; candidates: QueryHopCandidate[]; expandedNodes: QueryNodeExpansion[] }> {
     const matches: MemoryMatch[] = [];
     const candidates: QueryHopCandidate[] = [];
+    const expandedNodes: QueryNodeExpansion[] = [];
     for (const nodeId of nodeIds) {
       const graph = await this.graphStore.graph(nodeId);
-      for (const entity of graph.entities) {
-        candidates.push({ id: entity.id, title: entity.name, summary: truncateText(entity.summary, MAX_MATCH_TEXT_CHARS) });
-      }
-      for (const relation of graph.relations.slice(0, limit)) {
-        matches.push({
+      const entityById = new Map(graph.entities.map((entity) => [entity.id, entity]));
+      const nodeEntity = entityById.get(nodeId);
+      const nodeRelations = prioritizedRelationsForNode(graph, nodeId, intent).slice(0, MAX_RELATIONS_PER_NODE);
+      const nodeMatches: MemoryMatch[] = [];
+      for (const relation of nodeRelations) {
+        const relationMatch: MemoryMatch = {
           kind: "relation",
           id: relation.id,
           title: relation.predicate,
           text: relation.description ?? `${relation.sourceId} ${relation.predicate} ${relation.targetId}`,
-          score: 0.8
-        });
+          score: 0.8,
+          metadata: relationMatchesIntent(graph, relation, nodeId, intent) ? { targetEntityTypeHit: true } : undefined
+        };
+        matches.push(relationMatch);
+        nodeMatches.push(relationMatch);
       }
+      const candidateIds = uniqueStrings(
+        nodeRelations
+          .flatMap((relation) => [relation.sourceId, relation.targetId])
+          .filter((id) => id !== nodeId)
+      );
+      for (const id of candidateIds) {
+        const entity = entityById.get(id);
+        if (!entity) continue;
+        const entityMatch: MemoryMatch = {
+          kind: "entity",
+          id: entity.id,
+          title: entity.name,
+          text: [entity.name, entity.summary, entity.aliases.join(" "), entity.tags.join(" ")].filter(Boolean).join("\n"),
+          score: 0.75
+        };
+        matches.push(entityMatch);
+        nodeMatches.push(entityMatch);
+        candidates.push({ id: entity.id, title: entity.name, summary: truncateText(entity.summary, MAX_MATCH_TEXT_CHARS) });
+      }
+      expandedNodes.push({
+        id: nodeId,
+        title: nodeEntity?.name ?? nodeId,
+        matches: matchLogItems(nodeMatches),
+        nextCandidates: candidates.filter((candidate) => candidateIds.includes(candidate.id)).map(candidateLogItem)
+      });
     }
     return {
-      matches: dedupeMatches(matches),
-      candidates: dedupeCandidates(candidates)
+      matches: dedupeMeaningfulMatches(matches),
+      candidates: dedupeCandidates(candidates),
+      expandedNodes
     };
   }
 
@@ -673,6 +668,44 @@ function dedupeMatches<T extends { kind: string; id: string }>(matches: T[]): T[
   });
 }
 
+function dedupeMeaningfulMatches<T extends { kind: string; id: string; title: string; text: string }>(matches: T[]): T[] {
+  const seenIds = new Set<string>();
+  const seenMeanings = new Set<string>();
+  return matches.filter((match) => {
+    const idKey = `${match.kind}:${match.id}`;
+    if (seenIds.has(idKey)) return false;
+    const meaningKey = `${match.kind}:${normalizeComparableText([match.title, match.text].join(" "))}`;
+    if (seenMeanings.has(meaningKey)) return false;
+    seenIds.add(idKey);
+    seenMeanings.add(meaningKey);
+    return true;
+  });
+}
+
+function selectEvidenceMatches(matches: MemoryMatch[]): MemoryMatch[] {
+  const relations = matches.filter((match) => match.kind === "relation");
+  const targetRelations = relations.filter((match) => match.metadata?.targetEntityTypeHit === true);
+  if (targetRelations.length > 0) return targetRelations;
+  return relations.length > 0 ? relations : matches;
+}
+
+function matchLogItems(matches: MemoryMatch[]): QueryLogMatch[] {
+  return matches.map((match) => ({
+    kind: match.kind,
+    id: match.id,
+    title: match.title,
+    text: truncateText(match.text, 160)
+  }));
+}
+
+function candidateLogItem(candidate: QueryHopCandidate): QueryLogCandidate {
+  return {
+    id: candidate.id,
+    title: candidate.title,
+    summary: truncateText(candidate.summary, 160)
+  };
+}
+
 function dedupeCandidates(candidates: QueryHopCandidate[]): QueryHopCandidate[] {
   const seen = new Set<string>();
   return candidates.filter((candidate) => {
@@ -694,13 +727,55 @@ function entityCandidatesFromMatches(matches: MemoryMatch[]): QueryHopCandidate[
   );
 }
 
-function shouldAskModelForExpansion(matches: MemoryMatch[]): boolean {
-  return matches.length > 0 && matches.every((match) => match.kind === "entity");
+function querySearchTerms(interpretation: QueryInterpretation): string[] {
+  const terms = uniqueStrings([...interpretation.keywords, ...interpretation.entities, ...interpretation.predicates]);
+  return terms.length > 0 ? terms : uniqueStrings([interpretation.expandedQuery]);
 }
 
-function expansionSkipReason(matches: MemoryMatch[]): string {
-  if (matches.length === 0) return "no direct matches";
-  return "direct matches already include evidence";
+function inferQueryIntent(query: string, interpretation: QueryInterpretation): QueryIntent {
+  const text = normalizeComparableText([query, ...interpretation.keywords, ...interpretation.entities, ...interpretation.predicates, interpretation.expandedQuery].join(" "));
+  const targetEntityTypes: Entity["type"][] = [];
+  if (/\b(who|whom|person|people|reviewer|reviewers|owner|owners|assignee|assignees|approver|approvers|author|authors)\b/.test(text) || /谁|哪位|提给谁|提交给谁|负责人|评审人|审核人|审批人|作者/.test(text)) {
+    targetEntityTypes.push("person");
+  }
+  return { targetEntityTypes: uniqueEntityTypes(targetEntityTypes) };
+}
+
+function prioritizedRelationsForNode(graph: GraphSnapshot, nodeId: string, intent: QueryIntent): Relation[] {
+  const entityById = new Map(graph.entities.map((entity) => [entity.id, entity]));
+  return graph.relations
+    .filter((relation) => relation.sourceId === nodeId || relation.targetId === nodeId)
+    .map((relation, index) => ({
+      relation,
+      index,
+      score: relationIntentScore(relation, nodeId, entityById, intent)
+    }))
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map((item) => item.relation);
+}
+
+function relationIntentScore(relation: Relation, nodeId: string, entityById: Map<string, Entity>, intent: QueryIntent): number {
+  const otherId = relation.sourceId === nodeId ? relation.targetId : relation.sourceId;
+  const otherEntity = entityById.get(otherId);
+  if (!otherEntity) return 0;
+  if (intent.targetEntityTypes.includes(otherEntity.type)) return 10;
+  if (otherEntity.tags.some((tag) => intent.targetEntityTypes.includes(tag as Entity["type"]))) return 8;
+  return 0;
+}
+
+function relationMatchesIntent(graph: GraphSnapshot, relation: Relation, nodeId: string, intent: QueryIntent): boolean {
+  if (intent.targetEntityTypes.length === 0) return false;
+  const entityById = new Map(graph.entities.map((entity) => [entity.id, entity]));
+  return relationIntentScore(relation, nodeId, entityById, intent) > 0;
+}
+
+function uniqueEntityTypes(values: Entity["type"][]): Entity["type"][] {
+  const seen = new Set<Entity["type"]>();
+  return values.filter((value) => {
+    if (seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
 }
 
 function ingestMeta(status: IngestResult["meta"]["status"], entitiesMerged: number, relationsMerged: number, reason?: string): IngestResult["meta"] {
@@ -890,23 +965,15 @@ function jaccard(left: string[], right: string[]): number {
   return intersection / new Set([...leftSet, ...rightSet]).size;
 }
 
-function normalizeMaxHops(value: number | undefined): number {
-  if (value === undefined) return DEFAULT_MAX_HOPS;
-  if (!Number.isFinite(value)) return DEFAULT_MAX_HOPS;
-  return Math.min(Math.max(Math.trunc(value), 0), MAX_HOPS);
-}
-
 function normalizeQueryLimit(value: number | undefined): number {
   if (value === undefined) return DEFAULT_QUERY_LIMIT;
   if (!Number.isFinite(value)) return DEFAULT_QUERY_LIMIT;
   return Math.min(Math.max(Math.trunc(value), 1), MAX_QUERY_MATCHES);
 }
 
-function normalizeQueryMatches(matches: MemoryMatch[]): MemoryMatch[] {
-  return dedupeMatches(matches)
-    .filter((match) => match.kind === "entity" || match.kind === "relation")
-    .slice(0, MAX_QUERY_MATCHES)
-    .map((match) => ({
+function normalizeQueryMatches(matches: MemoryMatch[], maxMatches?: number): MemoryMatch[] {
+  const normalized = dedupeMeaningfulMatches(matches).filter((match) => match.kind === "entity" || match.kind === "relation");
+  return (maxMatches === undefined ? normalized : normalized.slice(0, maxMatches)).map((match) => ({
       ...match,
       text: truncateText(match.text, MAX_MATCH_TEXT_CHARS)
     }));
@@ -920,6 +987,30 @@ function truncateText(value: string | undefined, maxChars: number): string {
 
 type QueryProgressReporter = (stage: string, details?: Record<string, unknown>) => Promise<void>;
 type IngestProgressReporter = (stage: string, payload?: { input?: unknown; output?: unknown; details?: Record<string, unknown> }) => Promise<void>;
+
+interface QueryLogMatch {
+  kind: MemoryMatch["kind"];
+  id: string;
+  title: string;
+  text: string;
+}
+
+interface QueryLogCandidate {
+  id: string;
+  title: string;
+  summary: string;
+}
+
+interface QueryNodeExpansion {
+  id: string;
+  title: string;
+  matches: QueryLogMatch[];
+  nextCandidates: QueryLogCandidate[];
+}
+
+interface QueryIntent {
+  targetEntityTypes: Entity["type"][];
+}
 
 interface IngestCacheEntry {
   id: string;
