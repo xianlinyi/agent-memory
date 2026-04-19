@@ -1,7 +1,7 @@
 import { dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import type { GraphStore } from "./graph-store.js";
+import type { GraphStore, SearchOptions } from "./graph-store.js";
 import type { Entity, Episode, GraphSnapshot, MemoryMatch, MemoryStatus, Relation, SourceRef } from "../types.js";
 import { importNodeSqlite } from "../utils/node-sqlite.js";
 
@@ -176,19 +176,21 @@ export class NodeSqliteFtsGraphStore implements GraphStore {
     this.database.prepare("INSERT OR IGNORE INTO entity_episode_refs(episode_id, entity_id) VALUES (?, ?)").run(episodeId, entityId);
   }
 
-  async search(query: string, limit: number): Promise<MemoryMatch[]> {
+  async search(query: string, limit: number, options?: SearchOptions): Promise<MemoryMatch[]> {
     const ftsQuery = toFtsQuery(query);
     if (!ftsQuery) return [];
+    const kinds = uniqueSearchKinds(options?.kinds);
 
     const rows = this.database
       .prepare(
         `SELECT kind, ref_id, title, text, rank
          FROM memory_fts
          WHERE memory_fts MATCH ?
+           AND (${kinds.length === 0 ? "1" : `kind IN (${kinds.map(() => "?").join(", ")})`})
          ORDER BY rank
          LIMIT ?`
       )
-      .all(ftsQuery, limit) as Array<{ kind: string; ref_id: string; title: string; text: string; rank: number }>;
+      .all(ftsQuery, ...kinds, limit) as Array<{ kind: string; ref_id: string; title: string; text: string; rank: number }>;
 
     return rows.map((row, index) => ({
       kind: row.kind as MemoryMatch["kind"],
@@ -227,6 +229,15 @@ export class NodeSqliteFtsGraphStore implements GraphStore {
     return entities;
   }
 
+  async findRelationsByIds(ids: string[]): Promise<Relation[]> {
+    const relations: Relation[] = [];
+    for (const id of ids) {
+      const relation = this.readRelation(id);
+      if (relation) relations.push(relation);
+    }
+    return relations;
+  }
+
   async findEntityCandidates(input: { name: string; aliases?: string[]; type?: Entity["type"]; limit?: number }): Promise<Entity[]> {
     const limit = Math.max(1, input.limit ?? 20);
     const names = uniqueNormalized([input.name, ...(input.aliases ?? [])]);
@@ -251,7 +262,7 @@ export class NodeSqliteFtsGraphStore implements GraphStore {
     }
 
     if (candidates.size < limit) {
-      const matches = await this.search([input.name, ...(input.aliases ?? [])].join(" "), limit);
+      const matches = await this.search([input.name, ...(input.aliases ?? [])].join(" "), limit, { kinds: ["entity"] });
       for (const match of matches.filter((item) => item.kind === "entity")) {
         const entity = this.readEntity(match.id);
         if (!entity) continue;
@@ -606,6 +617,11 @@ function toFtsQuery(query: string): string {
     .filter(Boolean)
     .map((term) => `"${term}"`)
     .join(" OR ");
+}
+
+function uniqueSearchKinds(kinds: MemoryMatch["kind"][] | undefined): MemoryMatch["kind"][] {
+  const allowed = new Set<MemoryMatch["kind"]>(["entity", "relation", "episode", "source"]);
+  return [...new Set(kinds ?? [])].filter((kind) => allowed.has(kind));
 }
 
 const SCHEMA_SQL = `

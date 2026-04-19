@@ -2,11 +2,17 @@ import { mkdir, appendFile } from "node:fs/promises";
 import { join } from "node:path";
 import { approveAll, CopilotClient } from "@github/copilot-sdk";
 import type { CopilotClientOptions, CopilotSession, SessionConfig } from "@github/copilot-sdk";
-import type { ExtractedMemory, MemoryMatch, QueryHopCandidate, QueryHopDecision, QueryInterpretation } from "../types.js";
+import type { ExtractedMemory, IngestKeyInformation, IngestReviewDecision, MemoryMatch, QueryHopCandidate, QueryHopDecision, QueryInterpretation } from "../types.js";
 import {
   answerPrompt,
   compactPrompt,
   extractionPrompt,
+  ingestEntitiesPrompt,
+  ingestKeyInformationPrompt,
+  ingestOutcomePrompt,
+  ingestReviewPrompt,
+  parseRequiredIngestKeyInformation,
+  parseRequiredIngestReviewDecision,
   parseRequiredExtraction,
   parseRequiredQueryHopDecision,
   parseRequiredQueryInterpretation,
@@ -14,6 +20,7 @@ import {
   queryPrompt
 } from "./extraction.js";
 import type { ModelProvider } from "./model-provider.js";
+import type { IngestModelSession } from "./model-provider.js";
 
 export interface CopilotSdkModelProviderOptions {
   model?: string;
@@ -40,6 +47,57 @@ export class CopilotSdkModelProvider implements ModelProvider {
   async extractMemory(input: { text: string }): Promise<ExtractedMemory> {
     const output = await this.send(extractionPrompt(input.text));
     return parseRequiredExtraction(output);
+  }
+
+  async startIngestSession(): Promise<IngestModelSession> {
+    const client = await this.getClient();
+    const session = await client.createSession(this.sessionConfig());
+    const trace = this.createTrace(session);
+    const unsubscribe = session.on((event) => {
+      void trace.write("event", { eventType: event.type, event });
+    });
+    await trace.write("session.created", {
+      sessionId: session.sessionId,
+      workspacePath: session.workspacePath,
+      model: this.options.model,
+      reasoningEffort: this.options.reasoningEffort,
+      configDir: this.options.configDir,
+      cwd: this.options.cwd,
+      purpose: "ingest"
+    });
+
+    const run = async (prompt: string) => {
+      try {
+        await trace.write("prompt", { prompt });
+        const response = await session.sendAndWait({ prompt }, this.options.timeoutMs);
+        const output = response?.data.content?.trim();
+        await trace.write("response", { output, response });
+        return output;
+      } catch (error) {
+        await trace.write("error", { message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack : undefined });
+        throw new Error(`LLM provider call failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+
+    return {
+      extractKeyInformation: async (input: { text: string }): Promise<IngestKeyInformation> => parseRequiredIngestKeyInformation(await run(ingestKeyInformationPrompt(input.text))),
+      extractEntitiesAndRelations: async (input: { keyInformation: IngestKeyInformation }): Promise<ExtractedMemory> =>
+        parseRequiredExtraction(await run(ingestEntitiesPrompt(input.keyInformation))),
+      classifyOutcomeAndExtractSuccess: async (input: { keyInformation: IngestKeyInformation; extraction: ExtractedMemory }): Promise<ExtractedMemory> =>
+        parseRequiredExtraction(await run(ingestOutcomePrompt(input))),
+      reviewIngestMemory: async (input: { extraction: ExtractedMemory; candidates: MemoryMatch[] }): Promise<IngestReviewDecision> =>
+        parseRequiredIngestReviewDecision(await run(ingestReviewPrompt(input)), input.candidates),
+      close: async () => {
+        unsubscribe();
+        await session.disconnect().catch((error) => trace.write("disconnect.error", { message: error instanceof Error ? error.message : String(error) }));
+        await trace.write("session.disconnected", { sessionId: session.sessionId });
+      }
+    };
+  }
+
+  async reviewIngestMemory(input: { extraction: ExtractedMemory; candidates: MemoryMatch[] }): Promise<IngestReviewDecision> {
+    const output = await this.send(ingestReviewPrompt(input));
+    return parseRequiredIngestReviewDecision(output, input.candidates);
   }
 
   async extractQuery(input: { text: string }): Promise<QueryInterpretation> {

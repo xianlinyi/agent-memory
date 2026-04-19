@@ -1,9 +1,15 @@
 import { spawn } from "node:child_process";
-import type { ExtractedMemory, MemoryMatch, QueryHopCandidate, QueryHopDecision, QueryInterpretation } from "../types.js";
+import type { ExtractedMemory, IngestKeyInformation, IngestReviewDecision, MemoryMatch, QueryHopCandidate, QueryHopDecision, QueryInterpretation } from "../types.js";
 import {
   answerPrompt,
   compactPrompt,
   extractionPrompt,
+  ingestEntitiesPrompt,
+  ingestKeyInformationPrompt,
+  ingestOutcomePrompt,
+  ingestReviewPrompt,
+  parseRequiredIngestKeyInformation,
+  parseRequiredIngestReviewDecision,
   parseRequiredExtraction,
   parseRequiredQueryHopDecision,
   parseRequiredQueryInterpretation,
@@ -11,6 +17,7 @@ import {
   queryPrompt
 } from "./extraction.js";
 import type { ModelProvider } from "./model-provider.js";
+import type { IngestModelSession } from "./model-provider.js";
 
 export interface CopilotCliModelProviderOptions {
   command: string;
@@ -32,6 +39,31 @@ export class CopilotCliModelProvider implements ModelProvider {
   async extractMemory(input: { text: string }): Promise<ExtractedMemory> {
     const output = await this.tryRun(extractionPrompt(input.text));
     return parseRequiredExtraction(output);
+  }
+
+  async startIngestSession(): Promise<IngestModelSession> {
+    const transcript: Array<{ prompt: string; response: string }> = [];
+    const run = async (prompt: string) => {
+      const contextualPrompt = transcript.length === 0 ? prompt : `${formatTranscript(transcript)}\n\nNext prompt:\n${prompt}`;
+      const output = await this.tryRun(contextualPrompt);
+      transcript.push({ prompt, response: output ?? "" });
+      return output;
+    };
+
+    return {
+      extractKeyInformation: async (input: { text: string }): Promise<IngestKeyInformation> => parseRequiredIngestKeyInformation(await run(ingestKeyInformationPrompt(input.text))),
+      extractEntitiesAndRelations: async (input: { keyInformation: IngestKeyInformation }): Promise<ExtractedMemory> =>
+        parseRequiredExtraction(await run(ingestEntitiesPrompt(input.keyInformation))),
+      classifyOutcomeAndExtractSuccess: async (input: { keyInformation: IngestKeyInformation; extraction: ExtractedMemory }): Promise<ExtractedMemory> =>
+        parseRequiredExtraction(await run(ingestOutcomePrompt(input))),
+      reviewIngestMemory: async (input: { extraction: ExtractedMemory; candidates: MemoryMatch[] }): Promise<IngestReviewDecision> =>
+        parseRequiredIngestReviewDecision(await run(ingestReviewPrompt(input)), input.candidates)
+    };
+  }
+
+  async reviewIngestMemory(input: { extraction: ExtractedMemory; candidates: MemoryMatch[] }): Promise<IngestReviewDecision> {
+    const output = await this.tryRun(ingestReviewPrompt(input));
+    return parseRequiredIngestReviewDecision(output, input.candidates);
   }
 
   async extractQuery(input: { text: string }): Promise<QueryInterpretation> {
@@ -98,6 +130,13 @@ export class CopilotCliModelProvider implements ModelProvider {
       throw new Error(`LLM provider call failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+}
+
+function formatTranscript(transcript: Array<{ prompt: string; response: string }>): string {
+  return [
+    "Previous messages in this ingest session:",
+    ...transcript.flatMap((item, index) => [`Prompt ${index + 1}:`, item.prompt, `Response ${index + 1}:`, item.response])
+  ].join("\n");
 }
 
 function runCommand(command: string, args: string[], prompt: string, promptInput: "stdin" | "argument" | undefined, timeoutMs: number): Promise<string> {

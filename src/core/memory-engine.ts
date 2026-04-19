@@ -1,6 +1,6 @@
-import { readFile } from "node:fs/promises";
-import { basename, resolve } from "node:path";
-import { applyAutomaticCopilotIsolation, defaultConfig, loadConfig, writeConfig } from "../config.js";
+import { mkdir, readFile, readdir, unlink, writeFile } from "node:fs/promises";
+import { basename, join, resolve } from "node:path";
+import { applyAutomaticCopilotIsolation, defaultConfig, INTERNAL_DIR, loadConfig, writeConfig } from "../config.js";
 import { normalizeExtraction } from "../model/extraction.js";
 import { createModelProvider } from "../model/model-factory.js";
 import type { ModelProvider } from "../model/model-provider.js";
@@ -12,9 +12,12 @@ import type {
   AgentMemoryConfig,
   Entity,
   Episode,
+  ExtractedMemory,
   GraphSnapshot,
   IngestInput,
+  IngestKeyInformation,
   IngestResult,
+  IngestReviewDecision,
   MemoryMatch,
   MemoryStatus,
   QueryHopCandidate,
@@ -33,6 +36,13 @@ import { ObsidianVaultStore, type VaultStore } from "../vault/vault-store.js";
 const DEFAULT_MAX_HOPS = 2;
 const MAX_HOPS = 3;
 const MAX_NODES_PER_HOP = 5;
+const DEFAULT_QUERY_LIMIT = 5;
+const MAX_QUERY_MATCHES = 5;
+const MAX_MATCH_TEXT_CHARS = 2000;
+const INGEST_CACHE_DIR = "ingest-cache";
+const INGEST_CACHE_PROMOTION_RANK = 5;
+const INGEST_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const INGEST_CACHE_SIMILARITY_THRESHOLD = 0.75;
 
 export interface MemoryEngineOptions {
   vaultPath: string;
@@ -126,7 +136,94 @@ export class MemoryEngine {
       };
     }
 
-    const extracted = normalizeExtraction(await this.modelProvider.extractMemory({ text: input.text }));
+    const session = await this.modelProvider.startIngestSession?.();
+    let keyInformation: IngestKeyInformation | undefined;
+    let extracted: ExtractedMemory;
+    let review: IngestReviewDecision | undefined;
+    try {
+      if (session) {
+        keyInformation = await session.extractKeyInformation({ text: input.text });
+        extracted = normalizeExtraction(await session.extractEntitiesAndRelations({ keyInformation }));
+        if (extracted.entities.length === 0) {
+          await session.close?.();
+          return {
+            episode: skippedEpisode(input.text, extracted.summary || keyInformation.summary, timestamp),
+            entities: [],
+            relations: [],
+            meta: ingestMeta("skipped", 0, 0, "no meaningful durable entities")
+          };
+        }
+        if (!extracted.hasExplicitRelationOrBehaviorPath) {
+          const cacheResult = await this.recordIngestCache(keyInformation, extracted, timestamp);
+          if (!cacheResult.promoted) {
+            await session.close?.();
+            return {
+              episode: skippedEpisode(input.text, extracted.summary || keyInformation.summary, timestamp),
+              entities: [],
+              relations: [],
+              meta: ingestMeta("skipped", 0, 0, `cached pending confirmation rank=${cacheResult.rank}`)
+            };
+          }
+        }
+        extracted = normalizeExtraction(await session.classifyOutcomeAndExtractSuccess({ keyInformation, extraction: extracted }));
+      } else {
+        extracted = normalizeExtraction(await this.modelProvider.extractMemory({ text: input.text }));
+      }
+    } catch (error) {
+      await session?.close?.();
+      throw error;
+    }
+    if (extracted.experienceOutcome !== "success") {
+      await session?.close?.();
+      return {
+        episode: skippedEpisode(input.text, extracted.summary, timestamp),
+        entities: [],
+        relations: [],
+        meta: ingestMeta("skipped", 0, 0, `experience outcome is ${extracted.experienceOutcome ?? "unknown"}`)
+      };
+    }
+    if (extracted.entities.length === 0) {
+      await session?.close?.();
+      return {
+        episode: skippedEpisode(input.text, extracted.summary, timestamp),
+        entities: [],
+        relations: [],
+        meta: ingestMeta("skipped", 0, 0, "no meaningful durable entities")
+      };
+    }
+
+    const reviewCandidates = await this.findIngestReviewCandidates(extracted, 5);
+    if (session) {
+      try {
+        review = await session.reviewIngestMemory({ extraction: extracted, candidates: reviewCandidates });
+      } catch (error) {
+        await session.close?.();
+        throw error;
+      }
+      await session.close?.();
+    } else {
+      review = this.modelProvider.reviewIngestMemory ? await this.modelProvider.reviewIngestMemory({ extraction: extracted, candidates: reviewCandidates }) : undefined;
+    }
+    if (review?.successExperience) {
+      extracted = { ...extracted, successExperience: review.successExperience };
+    }
+    if (review?.action === "skip") {
+      return {
+        episode: skippedEpisode(input.text, extracted.summary, timestamp),
+        entities: [],
+        relations: [],
+        meta: ingestMeta("duplicate", 0, 0, review.reason ?? "duplicate or highly similar memory")
+      };
+    }
+
+    const reviewReplacementEntities =
+      review?.action === "replace" && review.replaceEntityIds.length > 0
+        ? (await this.graphStore.findEntitiesByIds?.(review.replaceEntityIds)) ?? (await getExistingSnapshot()).entities.filter((entity) => review.replaceEntityIds.includes(entity.id))
+        : [];
+    const reviewReplacementRelations =
+      review?.action === "replace" && review.replaceRelationIds.length > 0
+        ? (await this.graphStore.findRelationsByIds?.(review.replaceRelationIds)) ?? (await getExistingSnapshot()).relations.filter((relation) => review.replaceRelationIds.includes(relation.id))
+        : [];
     const source = sourceDraft ? await this.createSource(sourceDraft) : undefined;
 
     const entities: Entity[] = [];
@@ -148,11 +245,17 @@ export class MemoryEngine {
         updatedAt: timestamp,
         externalRefs: partial.externalRefs
       };
-      const candidates =
-        (await this.graphStore.findEntityCandidates?.({ name: incoming.name, aliases: incoming.aliases, type: incoming.type, limit: 20 })) ??
-        (await getExistingSnapshot()).entities;
-      const match = findSimilarEntity(candidates, incoming);
-      const entity = match ? mergeEntity(match, incoming, timestamp) : incoming;
+      const match =
+        review?.action === "replace"
+          ? findSimilarEntity(reviewReplacementEntities, incoming) ?? takeFirstUnusedEntity(reviewReplacementEntities, entities)
+          : review
+            ? undefined
+            : findSimilarEntity(
+                (await this.graphStore.findEntityCandidates?.({ name: incoming.name, aliases: incoming.aliases, type: incoming.type, limit: 20 })) ??
+                  (await getExistingSnapshot()).entities,
+                incoming
+              );
+      const entity = match ? (review?.action === "replace" ? replaceEntity(match, incoming, timestamp) : mergeEntity(match, incoming, timestamp)) : incoming;
       if (match) entitiesMerged += 1;
       const written = await this.vaultStore.writeEntity(entity);
       await this.graphStore.upsertEntity(written);
@@ -167,9 +270,9 @@ export class MemoryEngine {
 
     const episode: Episode = {
       id: stableId("episode", [source?.id, input.text]),
-      title: extracted.summary.split(/\s+/).slice(0, 8).join(" ") || input.text.split(/\s+/).slice(0, 8).join(" ") || "Memory episode",
+      title: (extracted.successExperience ?? extracted.summary).split(/\s+/).slice(0, 8).join(" ") || input.text.split(/\s+/).slice(0, 8).join(" ") || "Memory episode",
       text: input.text,
-      summary: extracted.summary,
+      summary: extracted.successExperience ?? extracted.summary,
       sourceId: source?.id,
       entityIds: entities.map((entity) => entity.id),
       createdAt: timestamp,
@@ -197,16 +300,21 @@ export class MemoryEngine {
         createdAt: timestamp,
         updatedAt: timestamp
       };
-      const match = this.graphStore.findRelationByTriple
-        ? await this.graphStore.findRelationByTriple({
-            sourceId: relation.sourceId,
-            predicate: relation.predicate,
-            targetId: relation.targetId
-        })
-        : findSimilarRelation((await getExistingSnapshot()).relations, relation);
-      const mergedRelation = match ? mergeRelation(match, relation, timestamp) : relation;
+      const match =
+        review?.action === "replace"
+          ? findSimilarRelation(reviewReplacementRelations, relation) ?? takeFirstUnusedRelation(reviewReplacementRelations, relations)
+          : review
+            ? undefined
+            : this.graphStore.findRelationByTriple
+              ? await this.graphStore.findRelationByTriple({
+                  sourceId: relation.sourceId,
+                  predicate: relation.predicate,
+                  targetId: relation.targetId
+                })
+              : findSimilarRelation((await getExistingSnapshot()).relations, relation);
+      const reviewedRelation = match ? (review?.action === "replace" ? replaceRelation(match, relation, timestamp) : mergeRelation(match, relation, timestamp)) : relation;
       if (match) relationsMerged += 1;
-      const written = await this.vaultStore.writeRelation(mergedRelation);
+      const written = await this.vaultStore.writeRelation(reviewedRelation);
       await this.graphStore.upsertRelation(written);
       relations.push(written);
     }
@@ -218,7 +326,7 @@ export class MemoryEngine {
     const trace = createQueryTracer(input.onProgress);
     await this.ensureReady();
     await trace("ensureReady");
-    const limit = input.limit ?? 10;
+    const limit = normalizeQueryLimit(input.limit);
     const maxHops = normalizeMaxHops(input.maxHops);
     await trace("prepare", { limit, maxHops });
     const interpretation = await this.modelProvider.extractQuery({ text: input.text });
@@ -227,7 +335,7 @@ export class MemoryEngine {
       entities: interpretation.entities.length,
       predicates: interpretation.predicates.length
     });
-    const directMatches = await this.graphStore.search(interpretation.expandedQuery, limit);
+    const directMatches = normalizeQueryMatches(await this.graphStore.search(interpretation.expandedQuery, limit, { kinds: ["entity", "relation"] }));
     await trace("graph.search", { matches: directMatches.length });
     let traversal: QueryTraversalStep[] | undefined;
     let matches: MemoryMatch[];
@@ -236,7 +344,7 @@ export class MemoryEngine {
       await trace("graph.expand.skipped", { reason: "maxHops=0" });
     } else if (this.modelProvider.decideQueryHop && shouldAskModelForExpansion(directMatches)) {
       const expanded = await this.expandMatchesWithModel(input.text, interpretation, directMatches, limit, maxHops, trace);
-      matches = expanded.matches;
+      matches = normalizeQueryMatches(expanded.matches);
       traversal = expanded.traversal;
       await trace("graph.expand.model.complete", { matches: matches.length, hops: traversal.length });
     } else if (this.modelProvider.decideQueryHop) {
@@ -244,12 +352,12 @@ export class MemoryEngine {
       await trace("graph.expand.model.skipped", { reason: expansionSkipReason(directMatches) });
     } else {
       const expanded = await this.expandEntityMatches(directMatches, limit);
-      matches = dedupeMatches([...directMatches, ...expanded]).slice(0, limit);
+      matches = normalizeQueryMatches(dedupeMatches([...directMatches, ...expanded]).slice(0, limit));
       await trace("graph.expand.entities", { addedMatches: expanded.length, matches: matches.length });
     }
     let answer = "";
     if (input.synthesize !== false) {
-      answer = await this.modelProvider.synthesizeAnswer({ query: input.text, interpretation, matches });
+      answer = await this.modelProvider.synthesizeAnswer({ query: input.text, interpretation, matches: normalizeQueryMatches(matches) });
       await trace("model.synthesizeAnswer", { answerChars: answer.length });
     } else {
       await trace("model.synthesizeAnswer.skipped", { reason: "synthesize=false" });
@@ -371,6 +479,50 @@ export class MemoryEngine {
     return written;
   }
 
+  private async findIngestReviewCandidates(extracted: ExtractedMemory, limit: number): Promise<MemoryMatch[]> {
+    const terms = uniqueStrings([
+      extracted.successExperience ?? "",
+      extracted.summary,
+      ...extracted.entities.flatMap((entity) => [entity.name, entity.summary ?? "", ...(entity.aliases ?? []), ...(entity.tags ?? [])]),
+      ...extracted.relations.flatMap((relation) => [relation.sourceId, relation.predicate, relation.targetId, relation.description ?? ""])
+    ]);
+    return normalizeQueryMatches(await this.graphStore.search(terms.join(" "), limit, { kinds: ["entity", "relation"] }));
+  }
+
+  private async recordIngestCache(keyInformation: IngestKeyInformation, extraction: ExtractedMemory, timestamp: string): Promise<{ promoted: boolean; rank: number }> {
+    const cacheDir = join(this.config.vaultPath, INTERNAL_DIR, INGEST_CACHE_DIR);
+    await mkdir(cacheDir, { recursive: true });
+    const now = Date.parse(timestamp);
+    const entries = await readIngestCacheEntries(cacheDir, now);
+    const text = ingestCacheComparableText(keyInformation, extraction);
+    const best = entries
+      .map((entry) => ({ entry, similarity: textSimilarity(text, ingestCacheComparableText(entry.keyInformation, entry.extraction)) }))
+      .sort((left, right) => right.similarity - left.similarity)[0];
+
+    if (best && best.similarity >= INGEST_CACHE_SIMILARITY_THRESHOLD) {
+      const updated: IngestCacheEntry = {
+        ...best.entry,
+        rank: best.entry.rank + 1,
+        updatedAt: timestamp,
+        keyInformation,
+        extraction
+      };
+      await writeIngestCacheEntry(cacheDir, updated);
+      return { promoted: updated.rank >= INGEST_CACHE_PROMOTION_RANK, rank: updated.rank };
+    }
+
+    const entry: IngestCacheEntry = {
+      id: stableId("ingest-cache", [text]),
+      rank: 1,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      keyInformation,
+      extraction
+    };
+    await writeIngestCacheEntry(cacheDir, entry);
+    return { promoted: false, rank: entry.rank };
+  }
+
   private async expandEntityMatches(matches: Awaited<ReturnType<GraphStore["search"]>>, limit: number): Promise<Awaited<ReturnType<GraphStore["search"]>>> {
     const expanded: Awaited<ReturnType<GraphStore["search"]>> = [];
     for (const match of matches.filter((item) => item.kind === "entity")) {
@@ -436,7 +588,7 @@ export class MemoryEngine {
         addedMatches: expanded.matches.length,
         candidates: expanded.candidates.length
       });
-      matches = dedupeMatches([...matches, ...expanded.matches]).slice(0, limit);
+      matches = normalizeQueryMatches(dedupeMatches([...matches, ...expanded.matches]).slice(0, limit));
       traversal.push({
         hop: hop + 1,
         fromNodeIds: availableCandidates.map((candidate) => candidate.id),
@@ -456,7 +608,7 @@ export class MemoryEngine {
     for (const nodeId of nodeIds) {
       const graph = await this.graphStore.graph(nodeId);
       for (const entity of graph.entities) {
-        candidates.push({ id: entity.id, title: entity.name, summary: entity.summary });
+        candidates.push({ id: entity.id, title: entity.name, summary: truncateText(entity.summary, MAX_MATCH_TEXT_CHARS) });
       }
       for (const relation of graph.relations.slice(0, limit)) {
         matches.push({
@@ -511,7 +663,7 @@ function entityCandidatesFromMatches(matches: MemoryMatch[]): QueryHopCandidate[
       .map((match) => ({
         id: match.id,
         title: match.title,
-        summary: match.text
+        summary: truncateText(match.text, MAX_MATCH_TEXT_CHARS)
       }))
   );
 }
@@ -525,19 +677,43 @@ function expansionSkipReason(matches: MemoryMatch[]): string {
   return "direct matches already include evidence";
 }
 
-function ingestMeta(status: IngestResult["meta"]["status"], entitiesMerged: number, relationsMerged: number): IngestResult["meta"] {
+function ingestMeta(status: IngestResult["meta"]["status"], entitiesMerged: number, relationsMerged: number, reason?: string): IngestResult["meta"] {
   return {
     status,
     duplicate: status === "duplicate",
     merged: status === "merged",
+    skipped: status === "skipped",
     entitiesMerged,
-    relationsMerged
+    relationsMerged,
+    reason
+  };
+}
+
+function skippedEpisode(text: string, summary: string | undefined, timestamp: string): Episode {
+  return {
+    id: stableId("episode", ["skipped", text]),
+    title: summary?.split(/\s+/).slice(0, 8).join(" ") || text.split(/\s+/).slice(0, 8).join(" ") || "Skipped memory episode",
+    text,
+    summary,
+    entityIds: [],
+    createdAt: timestamp,
+    updatedAt: timestamp
   };
 }
 
 function findExactEpisode(episodes: Episode[], text: string): Episode | undefined {
   const normalizedText = normalizeComparableText(text);
   return episodes.find((episode) => normalizeComparableText(episode.text) === normalizedText);
+}
+
+function takeFirstUnusedEntity(candidates: Entity[], written: Entity[]): Entity | undefined {
+  const used = new Set(written.map((entity) => entity.id));
+  return candidates.find((candidate) => !used.has(candidate.id));
+}
+
+function takeFirstUnusedRelation(candidates: Relation[], written: Relation[]): Relation | undefined {
+  const used = new Set(written.map((relation) => relation.id));
+  return candidates.find((candidate) => !used.has(candidate.id));
 }
 
 function findSimilarEntity(entities: Entity[], incoming: Entity): Entity | undefined {
@@ -573,6 +749,17 @@ function mergeEntity(existing: Entity, incoming: Entity, timestamp: string): Ent
   };
 }
 
+function replaceEntity(existing: Entity, incoming: Entity, timestamp: string): Entity {
+  return {
+    ...incoming,
+    id: existing.id,
+    aliases: uniqueStrings([incoming.name, ...incoming.aliases].filter((alias) => normalizeComparableText(alias) !== normalizeComparableText(incoming.name))),
+    createdAt: existing.createdAt,
+    updatedAt: timestamp,
+    filePath: existing.filePath
+  };
+}
+
 function mergeRelation(existing: Relation, incoming: Relation, timestamp: string): Relation {
   return {
     ...existing,
@@ -580,6 +767,17 @@ function mergeRelation(existing: Relation, incoming: Relation, timestamp: string
     weight: Math.max(existing.weight, incoming.weight),
     confidence: Math.max(existing.confidence, incoming.confidence),
     evidenceIds: uniqueStrings([...existing.evidenceIds, ...incoming.evidenceIds]),
+    createdAt: existing.createdAt,
+    updatedAt: timestamp,
+    filePath: existing.filePath
+  };
+}
+
+function replaceRelation(existing: Relation, incoming: Relation, timestamp: string): Relation {
+  return {
+    ...incoming,
+    id: existing.id,
+    evidenceIds: uniqueStrings(incoming.evidenceIds),
     createdAt: existing.createdAt,
     updatedAt: timestamp,
     filePath: existing.filePath
@@ -672,7 +870,76 @@ function normalizeMaxHops(value: number | undefined): number {
   return Math.min(Math.max(Math.trunc(value), 0), MAX_HOPS);
 }
 
+function normalizeQueryLimit(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_QUERY_LIMIT;
+  if (!Number.isFinite(value)) return DEFAULT_QUERY_LIMIT;
+  return Math.min(Math.max(Math.trunc(value), 1), MAX_QUERY_MATCHES);
+}
+
+function normalizeQueryMatches(matches: MemoryMatch[]): MemoryMatch[] {
+  return dedupeMatches(matches)
+    .filter((match) => match.kind === "entity" || match.kind === "relation")
+    .slice(0, MAX_QUERY_MATCHES)
+    .map((match) => ({
+      ...match,
+      text: truncateText(match.text, MAX_MATCH_TEXT_CHARS)
+    }));
+}
+
+function truncateText(value: string | undefined, maxChars: number): string {
+  if (!value) return "";
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars).trimEnd()}\n[truncated]`;
+}
+
 type QueryProgressReporter = (stage: string, details?: Record<string, unknown>) => Promise<void>;
+
+interface IngestCacheEntry {
+  id: string;
+  rank: number;
+  createdAt: string;
+  updatedAt: string;
+  keyInformation: IngestKeyInformation;
+  extraction: ExtractedMemory;
+}
+
+async function readIngestCacheEntries(cacheDir: string, now: number): Promise<IngestCacheEntry[]> {
+  const entries: IngestCacheEntry[] = [];
+  for (const name of await readdir(cacheDir)) {
+    if (!name.endsWith(".json")) continue;
+    const filePath = join(cacheDir, name);
+    try {
+      const parsed = JSON.parse(await readFile(filePath, "utf8")) as IngestCacheEntry;
+      const createdAt = Date.parse(parsed.createdAt);
+      if (Number.isFinite(createdAt) && now - createdAt > INGEST_CACHE_MAX_AGE_MS) {
+        await unlink(filePath).catch(() => undefined);
+        continue;
+      }
+      if (parsed.id && parsed.keyInformation && parsed.extraction) entries.push(parsed);
+    } catch {
+      await unlink(filePath).catch(() => undefined);
+    }
+  }
+  return entries;
+}
+
+async function writeIngestCacheEntry(cacheDir: string, entry: IngestCacheEntry): Promise<void> {
+  await writeFile(join(cacheDir, `${slugForCacheFile(entry.id)}.json`), `${JSON.stringify(entry, null, 2)}\n`, "utf8");
+}
+
+function slugForCacheFile(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_-]+/g, "-");
+}
+
+function ingestCacheComparableText(keyInformation: IngestKeyInformation, extraction: ExtractedMemory): string {
+  return [
+    keyInformation.summary,
+    ...keyInformation.facts,
+    extraction.summary,
+    ...extraction.entities.map((entity) => [entity.name, entity.summary, ...(entity.aliases ?? []), ...(entity.tags ?? [])].filter(Boolean).join(" ")),
+    ...extraction.relations.map((relation) => [relation.sourceId, relation.predicate, relation.targetId, relation.description].filter(Boolean).join(" "))
+  ].join("\n");
+}
 
 function createQueryTracer(onProgress?: QueryInput["onProgress"]): QueryProgressReporter {
   const startedAt = Date.now();

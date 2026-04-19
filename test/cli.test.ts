@@ -188,9 +188,20 @@ test("cli query json is compact unless details are requested", async () => {
   const script = `
 const fs = require("node:fs");
 const input = fs.readFileSync(0, "utf8");
-if (input.includes("Extract durable agent memory")) {
+if (input.includes("Review a proposed memory ingest")) {
   console.log(JSON.stringify({
+    action: "store",
+    reason: "new memory",
+    replaceEntityIds: [],
+    replaceRelationIds: [],
+    successExperience: "Preserve exact mappings between domain terms and durable technical artifacts."
+  }));
+} else if (input.includes("Step 3 is outcome classification")) {
+  console.log(JSON.stringify({
+    experienceOutcome: "success",
     summary: "etr represents cashir.temporary_receipt.",
+    successExperience: "Preserve exact mappings between domain terms and durable technical artifacts.",
+    hasExplicitRelationOrBehaviorPath: true,
     entities: [
       { name: "etr", type: "concept", summary: "etr is the contents of cashir.temporary_receipt." },
       { name: "cashir.temporary_receipt", type: "artifact", summary: "Temporary receipt table." }
@@ -209,6 +220,28 @@ if (input.includes("Extract durable agent memory")) {
         description: "etr represents the contents of cashir.temporary_receipt."
       }
     ]
+  }));
+} else if (input.includes("Step 2 is entity and relation extraction")) {
+  console.log(JSON.stringify({
+    summary: "etr represents cashir.temporary_receipt.",
+    hasExplicitRelationOrBehaviorPath: true,
+    entities: [
+      { name: "etr", type: "concept", summary: "etr is the contents of cashir.temporary_receipt." },
+      { name: "cashir.temporary_receipt", type: "artifact", summary: "Temporary receipt table." }
+    ],
+    relations: [
+      {
+        sourceId: "etr",
+        targetId: "cashir.temporary_receipt",
+        predicate: "represents_table_contents",
+        description: "etr is the contents of cashir.temporary_receipt."
+      }
+    ]
+  }));
+} else if (input.includes("step 1 is to extract only key information")) {
+  console.log(JSON.stringify({
+    summary: "etr represents cashir.temporary_receipt.",
+    facts: ["etr represents the contents of cashir.temporary_receipt."]
   }));
 } else if (input.includes("Interpret this memory search query")) {
   console.log(JSON.stringify({

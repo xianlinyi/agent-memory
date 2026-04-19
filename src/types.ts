@@ -63,9 +63,17 @@ export interface SourceRef {
 }
 
 export interface ExtractedMemory {
+  experienceOutcome?: "success" | "failure" | "unknown";
   summary: string;
+  successExperience?: string;
+  hasExplicitRelationOrBehaviorPath?: boolean;
   entities: Array<Partial<Entity> & Pick<Entity, "name">>;
   relations: Array<Pick<Relation, "sourceId" | "targetId" | "predicate"> & Partial<Relation>>;
+}
+
+export interface IngestKeyInformation {
+  summary: string;
+  facts: string[];
 }
 
 export interface QueryInterpretation {
@@ -118,12 +126,22 @@ export interface IngestResult {
   entities: Entity[];
   relations: Relation[];
   meta: {
-    status: "created" | "merged" | "duplicate";
+    status: "created" | "merged" | "duplicate" | "skipped";
     duplicate: boolean;
     merged: boolean;
+    skipped: boolean;
     entitiesMerged: number;
     relationsMerged: number;
+    reason?: string;
   };
+}
+
+export interface IngestReviewDecision {
+  action: "store" | "skip" | "replace";
+  reason?: string;
+  replaceEntityIds: string[];
+  replaceRelationIds: string[];
+  successExperience?: string;
 }
 
 export interface QueryProgressEvent {
