@@ -9,6 +9,8 @@ import {
   type ModelProvider,
   type ExtractedMemory,
   type GraphSnapshot,
+  type IngestKeyInformation,
+  type IngestModelSession,
   type QueryHopDecision,
   type QueryInterpretation
 } from "../src/index.js";
@@ -18,7 +20,9 @@ import { stringifyMarkdownDocument } from "../src/utils/frontmatter.js";
 class FakeModelProvider implements ModelProvider {
   async extractMemory(): Promise<ExtractedMemory> {
     return {
+      experienceOutcome: "success",
       summary: "Project Atlas uses Obsidian memory",
+      successExperience: "Use a local-first editable memory store for durable agent memory.",
       entities: [
         { name: "Ada Lovelace", type: "person", aliases: ["Ada"], tags: ["person"], confidence: 0.9 },
         { name: "Project Atlas", type: "project", aliases: ["Atlas"], tags: ["project"], confidence: 0.9 },
@@ -48,7 +52,7 @@ class FakeModelProvider implements ModelProvider {
     };
   }
 
-  async synthesizeAnswer(): Promise<string> {
+  async synthesizeAnswer(_input?: Parameters<ModelProvider["synthesizeAnswer"]>[0]): Promise<string> {
     return "Project Atlas uses Obsidian for memory.";
   }
 }
@@ -73,6 +77,136 @@ class EntityOnlyNavigatingModelProvider extends NavigatingModelProvider {
       entities: ["Ada Lovelace"],
       predicates: [],
       expandedQuery: "Ada"
+    };
+  }
+}
+
+class CapturingQueryModelProvider extends FakeModelProvider {
+  answerMatches: Array<Parameters<ModelProvider["synthesizeAnswer"]>[0]["matches"]> = [];
+
+  async extractMemory(): Promise<ExtractedMemory> {
+    return {
+      experienceOutcome: "success",
+      summary: "Commit and PR workflow should be remembered.",
+      successExperience: "Commit completed changes before creating a pull request for review.",
+      entities: [
+        { name: "commit and create pr", type: "rule", summary: "Commit changes and create a pull request.", aliases: [], tags: ["workflow"], confidence: 0.9 },
+        { name: "GitHub pull request", type: "artifact", summary: "A pull request used for code review.", aliases: ["pr"], tags: ["github"], confidence: 0.8 }
+      ],
+      relations: [
+        {
+          sourceId: "commit and create pr",
+          targetId: "GitHub pull request",
+          predicate: "creates",
+          description: "The workflow creates a GitHub pull request after committing changes.",
+          confidence: 0.9,
+          weight: 1
+        }
+      ]
+    };
+  }
+
+  async extractQuery(): Promise<QueryInterpretation> {
+    return {
+      keywords: ["commit", "create", "pr"],
+      entities: ["commit and create pr"],
+      predicates: ["creates"],
+      expandedQuery: "commit create pr"
+    };
+  }
+
+  async synthesizeAnswer(input: Parameters<ModelProvider["synthesizeAnswer"]>[0]): Promise<string> {
+    this.answerMatches.push(input.matches);
+    return "Use the commit and PR workflow.";
+  }
+}
+
+class SessionWorkflowModelProvider extends FakeModelProvider {
+  readonly sessionSteps: string[][] = [];
+
+  async startIngestSession(): Promise<IngestModelSession> {
+    const steps: string[] = [];
+    this.sessionSteps.push(steps);
+    const keyInformation: IngestKeyInformation = {
+      summary: "Commit changes before creating a pull request.",
+      facts: ["Commit completed changes.", "Create a pull request after committing."]
+    };
+    const extraction: ExtractedMemory = {
+      summary: keyInformation.summary,
+      hasExplicitRelationOrBehaviorPath: true,
+      entities: [{ name: "commit and create pr", type: "rule", aliases: [], tags: ["workflow"], confidence: 0.9 }],
+      relations: []
+    };
+
+    return {
+      extractKeyInformation: async () => {
+        steps.push("key");
+        return keyInformation;
+      },
+      extractEntitiesAndRelations: async () => {
+        steps.push("entities");
+        return extraction;
+      },
+      classifyOutcomeAndExtractSuccess: async () => {
+        steps.push("outcome");
+        return {
+          ...extraction,
+          experienceOutcome: "success",
+          successExperience: "Commit completed changes before creating a pull request for review."
+        };
+      },
+      reviewIngestMemory: async () => {
+        steps.push("review");
+        return { action: "store", replaceEntityIds: [], replaceRelationIds: [], reason: "new memory" };
+      },
+      close: async () => {
+        steps.push("close");
+      }
+    };
+  }
+}
+
+class CacheWorkflowModelProvider extends FakeModelProvider {
+  readonly sessionSteps: string[][] = [];
+
+  async startIngestSession(): Promise<IngestModelSession> {
+    const steps: string[] = [];
+    this.sessionSteps.push(steps);
+    const keyInformation: IngestKeyInformation = {
+      summary: "Prefer small focused commits before requesting review.",
+      facts: ["Small focused commits help review."]
+    };
+    const extraction: ExtractedMemory = {
+      summary: keyInformation.summary,
+      hasExplicitRelationOrBehaviorPath: false,
+      entities: [{ name: "focused commit practice", type: "rule", aliases: [], tags: ["workflow"], confidence: 0.8 }],
+      relations: []
+    };
+
+    return {
+      extractKeyInformation: async () => {
+        steps.push("key");
+        return keyInformation;
+      },
+      extractEntitiesAndRelations: async () => {
+        steps.push("entities");
+        return extraction;
+      },
+      classifyOutcomeAndExtractSuccess: async () => {
+        steps.push("outcome");
+        return {
+          ...extraction,
+          experienceOutcome: "success",
+          successExperience: "Use small focused commits before requesting review."
+        };
+      },
+      reviewIngestMemory: async () => {
+        steps.push("review");
+        return { action: "store", replaceEntityIds: [], replaceRelationIds: [], reason: "promoted cached memory" };
+      },
+      close: async () => {
+        steps.push("close");
+      }
     };
   }
 }
@@ -108,17 +242,20 @@ test("extraction prompt includes a concrete JSON template and scalar field rules
   const prompt = extractionPrompt("etr就是cashier.temporary_receipt表的数据");
 
   assert.match(prompt, /"experienceOutcome": "success"/);
-  assert.match(prompt, /"summary": "One concise sentence summarizing the durable memory."/);
+  assert.match(prompt, /"summary": "One concise sentence summarizing the key information."/);
+  assert.match(prompt, /"successExperience": "General reusable lesson for successful behavior, without specific entity names."/);
   assert.match(prompt, /"name": "Meaningful entity name exactly as it appears in the input"/);
   assert.match(prompt, /"entities": \[/);
   assert.match(prompt, /"relations": \[/);
-  assert.match(prompt, /First decide whether the input describes a success experience, a failure experience, or an unknown outcome/);
-  assert.match(prompt, /Extract only meaningful, durable entities and relationships/);
-  assert.match(prompt, /For failure experiences, first analyze whether there are named, durable, reusable entities worth remembering/);
+  assert.match(prompt, /Step 1: extract the key information from the input/);
+  assert.match(prompt, /Step 2: strictly decide whether the key information contains meaningful, durable entities/);
+  assert.match(prompt, /Step 3: decide whether the key information is essentially a successful behavior, a failed behavior, or unknown/);
+  assert.match(prompt, /successExperience as a public, reusable path or practice/);
   assert.match(prompt, /Treat best practices, durable preferences, constraints, repeatable procedures, and accepted approaches as rule entities/);
   assert.match(prompt, /Do not create entities for throwaway labels, internal codenames, arbitrary placeholders/);
   assert.match(prompt, /Do not introduce special names, codenames, or examples that are not present in the input/);
   assert.match(prompt, /experienceOutcome must be one of success, failure, unknown/);
+  assert.match(prompt, /successExperience must be a string/);
   assert.match(prompt, /summary must be a string/);
   assert.match(prompt, /Do not return nested objects or arrays inside string fields/);
   assert.match(prompt, /Preserve database, schema, table, API, file, and command names exactly/);
@@ -158,6 +295,142 @@ test("success experience extraction still requires durable entities", () => {
   );
 });
 
+test("ingest skips failed experiences before writing memory", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-failure-skip-"));
+  const engine = await MemoryEngine.create({
+    vaultPath,
+    modelProvider: {
+      async extractMemory(): Promise<ExtractedMemory> {
+        return {
+          experienceOutcome: "failure",
+          summary: "The attempted workflow did not work.",
+          successExperience: "",
+          entities: [{ name: "Failed workflow", type: "bug", aliases: [], tags: ["failure"], confidence: 0.7 }],
+          relations: []
+        };
+      },
+      async extractQuery(): Promise<QueryInterpretation> {
+        throw new Error("unused");
+      },
+      async synthesizeAnswer(): Promise<string> {
+        throw new Error("unused");
+      }
+    }
+  });
+
+  try {
+    await engine.init();
+    const result = await engine.ingest({ text: "Tried the workflow and it failed.", source: { kind: "cli", label: "Failure" } });
+    const snapshot = await engine.export();
+
+    assert.equal(result.meta.status, "skipped");
+    assert.equal(result.meta.skipped, true);
+    assert.equal(snapshot.entities.length, 0);
+    assert.equal(snapshot.relations.length, 0);
+    assert.equal(snapshot.episodes.length, 0);
+    assert.equal(snapshot.sources.length, 0);
+  } finally {
+    await engine.close();
+    await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
+test("ingest uses LLM review to skip highly similar successful memory", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-review-skip-"));
+  let reviewCalls = 0;
+  const engine = await MemoryEngine.create({
+    vaultPath,
+    modelProvider: {
+      async extractMemory(): Promise<ExtractedMemory> {
+        return {
+          experienceOutcome: "success",
+          summary: "Commit changes before creating a pull request.",
+          successExperience: "Commit completed changes before opening a pull request.",
+          entities: [{ name: "commit and create pr", type: "rule", aliases: [], tags: ["workflow"], confidence: 0.9 }],
+          relations: []
+        };
+      },
+      async reviewIngestMemory() {
+        reviewCalls += 1;
+        return reviewCalls === 1
+          ? { action: "store", replaceEntityIds: [], replaceRelationIds: [], reason: "new memory" }
+          : { action: "skip", replaceEntityIds: [], replaceRelationIds: [], reason: "highly similar memory" };
+      },
+      async extractQuery(): Promise<QueryInterpretation> {
+        throw new Error("unused");
+      },
+      async synthesizeAnswer(): Promise<string> {
+        throw new Error("unused");
+      }
+    }
+  });
+
+  try {
+    await engine.init();
+    const first = await engine.ingest({ text: "commit and create pr" });
+    const second = await engine.ingest({ text: "commit then create a pr" });
+    const snapshot = await engine.export();
+
+    assert.equal(first.meta.status, "created");
+    assert.equal(second.meta.status, "duplicate");
+    assert.equal(second.meta.duplicate, true);
+    assert.equal(snapshot.entities.length, 1);
+    assert.equal(snapshot.episodes.length, 1);
+  } finally {
+    await engine.close();
+    await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
+test("ingest workflow asks each step in the same model session", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-session-workflow-"));
+  const model = new SessionWorkflowModelProvider();
+  const engine = await MemoryEngine.create({ vaultPath, modelProvider: model });
+
+  try {
+    await engine.init();
+    const result = await engine.ingest({ text: "commit and create pr" });
+
+    assert.equal(result.meta.status, "created");
+    assert.deepEqual(model.sessionSteps, [["key", "entities", "outcome", "review", "close"]]);
+  } finally {
+    await engine.close();
+    await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
+test("ingest caches unconfirmed paths until similar observations reach rank five", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-cache-rank-"));
+  const model = new CacheWorkflowModelProvider();
+  const engine = await MemoryEngine.create({ vaultPath, modelProvider: model });
+
+  try {
+    await engine.init();
+    for (let index = 0; index < 4; index += 1) {
+      const result = await engine.ingest({ text: `observation ${index}: small focused commits help review` });
+      assert.equal(result.meta.status, "skipped");
+      assert.match(result.meta.reason ?? "", /cached pending confirmation rank=/);
+    }
+
+    const promoted = await engine.ingest({ text: "observation 5: small focused commits help review" });
+    const snapshot = await engine.export();
+
+    assert.equal(promoted.meta.status, "created");
+    assert.equal(snapshot.entities.length, 1);
+    assert.equal(snapshot.episodes.length, 1);
+    assert.deepEqual(model.sessionSteps.map((steps) => steps.join(",")), [
+      "key,entities,close",
+      "key,entities,close",
+      "key,entities,close",
+      "key,entities,close",
+      "key,entities,outcome,review,close"
+    ]);
+  } finally {
+    await engine.close();
+    await rm(vaultPath, { recursive: true, force: true });
+  }
+});
+
 test("answer prompt asks for concise non-enumerated replies", () => {
   const prompt = answerPrompt(
     "我创建etr的时候选了下拉框的值但是点保存以后没有显示",
@@ -195,6 +468,35 @@ test("query hop prompt makes graph expansion conservative", () => {
   assert.match(prompt, /specific missing entity\/relation\/detail/);
   assert.match(prompt, /Do not continue for broad context/);
   assert.match(prompt, /at most 3 nodes/);
+});
+
+test("query only sends top related entity and relation matches to the answer model", async () => {
+  const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-query-scope-"));
+  const model = new CapturingQueryModelProvider();
+  try {
+    const engine = await MemoryEngine.create({ vaultPath, modelProvider: model });
+    try {
+      await engine.init();
+      await engine.ingest({
+        text: `commit and create pr ${"very long original session ".repeat(1000)}`,
+        source: { kind: "cli", label: "Long session" }
+      });
+
+      const result = await engine.query({ text: "commit and create pr", limit: 10, maxHops: 0 });
+      const answerMatches = model.answerMatches[0] ?? [];
+
+      assert.equal(result.matches.length, answerMatches.length);
+      assert.ok(answerMatches.length <= 5);
+      assert.ok(answerMatches.length > 0);
+      assert.ok(answerMatches.every((match) => match.kind === "entity" || match.kind === "relation"));
+      assert.ok(answerMatches.every((match) => match.kind !== "episode" && match.kind !== "source"));
+      assert.ok(answerMatches.every((match) => match.text.length <= 2012));
+    } finally {
+      await engine.close();
+    }
+  } finally {
+    await rm(vaultPath, { recursive: true, force: true });
+  }
 });
 
 test("engine initializes, ingests, queries, links, rebuilds, and exports graph memory", async () => {
@@ -343,7 +645,9 @@ test("engine refuses query when provider cannot interpret with an LLM", async ()
     modelProvider: {
       async extractMemory() {
         return {
+          experienceOutcome: "success",
           summary: "Only extraction exists",
+          successExperience: "Store meaningful extraction results when no query can be answered.",
           entities: [{ name: "Only extraction", type: "concept", aliases: [], tags: [], confidence: 0.5 }],
           relations: []
         };
@@ -373,7 +677,9 @@ test("engine normalizes non-string extraction fields before storing", async () =
     modelProvider: {
       async extractMemory() {
         return {
+          experienceOutcome: "success",
           summary: "ETR maps to cashier temporary receipt",
+          successExperience: "Preserve exact technical object mappings when normalizing extracted fields.",
           entities: [
             {
               name: "etr",
@@ -432,7 +738,9 @@ test("engine skips storing exact duplicate memory text", async () => {
       async extractMemory() {
         extractionCalls += 1;
         return {
+          experienceOutcome: "success",
           summary: "Project Atlas uses Obsidian memory",
+          successExperience: "Record durable tool choices that support local memory workflows.",
           entities: [
             { name: "Project Atlas", type: "project", aliases: ["Atlas"], tags: ["project"], confidence: 0.9 },
             { name: "Obsidian", type: "artifact", aliases: [], tags: ["tool"], confidence: 0.9 }
@@ -473,7 +781,9 @@ test("engine enhances similar entities and relations instead of creating near du
   const vaultPath = await mkdtemp(join(tmpdir(), "agent-memory-merge-"));
   const extractions: ExtractedMemory[] = [
     {
+      experienceOutcome: "success",
       summary: "Project Atlas uses Obsidian memory",
+      successExperience: "Use an editable local memory store for durable agent memory.",
       entities: [
         { name: "Project Atlas", type: "project", summary: "Project Atlas stores memory.", aliases: ["Atlas"], tags: ["project"], confidence: 0.7 },
         { name: "Obsidian", type: "artifact", summary: "Obsidian is the memory vault.", aliases: [], tags: ["tool"], confidence: 0.8 }
@@ -481,7 +791,9 @@ test("engine enhances similar entities and relations instead of creating near du
       relations: [{ sourceId: "Project Atlas", targetId: "Obsidian", predicate: "uses", description: "Project Atlas uses Obsidian for memory.", confidence: 0.7 }]
     },
     {
+      experienceOutcome: "success",
       summary: "Atlas uses Obsidian for local first memory",
+      successExperience: "Prefer local-first memory storage that remains editable by humans.",
       entities: [
         { name: "Atlas", type: "project", summary: "Atlas stores local-first agent memory.", aliases: ["Project Atlas"], tags: ["local-first"], confidence: 0.95 },
         { name: "Obsidian", type: "artifact", summary: "Obsidian keeps the Markdown vault.", aliases: [], tags: ["markdown"], confidence: 0.9 }
@@ -543,7 +855,9 @@ test("engine uses SQLite duplicate and merge lookups without reading the full va
 
   const extractions: ExtractedMemory[] = [
     {
+      experienceOutcome: "success",
       summary: "Project Atlas uses Obsidian memory",
+      successExperience: "Use a local-first memory store for durable agent context.",
       entities: [
         { name: "Project Atlas", type: "project", aliases: ["Atlas"], tags: ["project"], confidence: 0.9 },
         { name: "Obsidian", type: "artifact", aliases: [], tags: ["tool"], confidence: 0.9 }
@@ -551,7 +865,9 @@ test("engine uses SQLite duplicate and merge lookups without reading the full va
       relations: [{ sourceId: "Project Atlas", targetId: "Obsidian", predicate: "uses", description: "Project Atlas uses Obsidian for memory." }]
     },
     {
+      experienceOutcome: "success",
       summary: "Atlas uses Obsidian for local first memory",
+      successExperience: "Keep durable agent memory in a human-editable local store.",
       entities: [
         { name: "Atlas", type: "project", aliases: ["Project Atlas"], tags: ["local-first"], confidence: 0.95 },
         { name: "Obsidian", type: "artifact", aliases: [], tags: ["markdown"], confidence: 0.9 }

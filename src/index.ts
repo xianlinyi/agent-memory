@@ -7,7 +7,7 @@ export { CopilotSdkModelProvider } from "./model/copilot-sdk-provider.js";
 export type { CopilotSdkModelProviderOptions } from "./model/copilot-sdk-provider.js";
 export { CopilotCliModelProvider } from "./model/copilot-cli-provider.js";
 export type { CopilotCliModelProviderOptions } from "./model/copilot-cli-provider.js";
-export type { ModelProvider } from "./model/model-provider.js";
+export type { IngestModelSession, ModelProvider } from "./model/model-provider.js";
 export type { GraphStore } from "./store/graph-store.js";
 export { NodeSqliteFtsGraphStore } from "./store/node-sqlite-fts-store.js";
 export { NoopEmbeddingProvider } from "./store/embedding.js";

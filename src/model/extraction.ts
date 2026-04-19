@@ -1,9 +1,10 @@
-import type { EntityType, ExtractedMemory, MemoryMatch, QueryHopCandidate, QueryHopDecision, QueryInterpretation } from "../types.js";
+import type { EntityType, ExtractedMemory, IngestKeyInformation, IngestReviewDecision, MemoryMatch, QueryHopCandidate, QueryHopDecision, QueryInterpretation } from "../types.js";
 
 export function extractionPrompt(text: string): string {
   const template = {
     experienceOutcome: "success",
-    summary: "One concise sentence summarizing the durable memory.",
+    summary: "One concise sentence summarizing the key information.",
+    successExperience: "General reusable lesson for successful behavior, without specific entity names.",
     entities: [
       {
         name: "Meaningful entity name exactly as it appears in the input",
@@ -31,14 +32,15 @@ export function extractionPrompt(text: string): string {
   };
 
   return [
-    "Extract durable agent memory from the input and return only strict JSON.",
-    "Use exactly this top-level shape: experienceOutcome, summary, entities, relations.",
-    "First decide whether the input describes a success experience, a failure experience, or an unknown outcome.",
-    "Extract only meaningful, durable entities and relationships that are explicitly stated or strongly implied by the input.",
-    "For success experiences, extract reusable entities and relations that explain what worked, what depends on what, or what should be remembered next time.",
-    "For failure experiences, first analyze whether there are named, durable, reusable entities worth remembering.",
-    "For failure experiences, return entities only for concrete reusable entities such as projects, bugs, files, tables, APIs, tools, commands, decisions, rules, or named concepts.",
-    "For failure experiences, use [] for entities and relations when the failure only describes a transient attempt, vague error, or non-reusable detail.",
+    "Run the ingest extraction workflow and return only strict JSON.",
+    "Use exactly this top-level shape: experienceOutcome, summary, successExperience, entities, relations.",
+    "Step 1: extract the key information from the input. The summary must describe only the key information.",
+    "Step 2: strictly decide whether the key information contains meaningful, durable entities. If it does not, return [] for entities and relations.",
+    "Step 2: when meaningful entities exist, extract only those entities and then extract only their directly supported relationships.",
+    "Step 3: decide whether the key information is essentially a successful behavior, a failed behavior, or unknown.",
+    "Step 3: for failed or unknown behavior, set successExperience to an empty string and do not invent success lessons.",
+    "Step 3: for successful behavior, extract successExperience as a public, reusable path or practice. It must not contain specific entity names, aliases, private codenames, project names, table names, API names, file names, user names, or one-off identifiers.",
+    "Step 3: successExperience must be generalized enough to guide future work across similar situations.",
     "Treat best practices, durable preferences, constraints, repeatable procedures, and accepted approaches as rule entities when they can guide future behavior.",
     "Do not create entities for throwaway labels, internal codenames, arbitrary placeholders, vague pronouns, or incidental words unless they identify a meaningful reusable thing.",
     "Do not introduce special names, codenames, or examples that are not present in the input.",
@@ -49,6 +51,7 @@ export function extractionPrompt(text: string): string {
     "Field rules:",
     "experienceOutcome must be one of success, failure, unknown.",
     "summary must be a string.",
+    "successExperience must be a string. Use an empty string unless experienceOutcome is success.",
     "entities must be an array. Each entity must include name. Use [] when there are no aliases or tags.",
     "Entity name, summary, aliases, tags, externalRefs values, relation IDs, predicates, and descriptions must be strings.",
     "Do not return nested objects or arrays inside string fields.",
@@ -62,6 +65,136 @@ export function extractionPrompt(text: string): string {
     "",
     "Input:",
     text
+  ].join("\n");
+}
+
+export function ingestKeyInformationPrompt(text: string): string {
+  const template: IngestKeyInformation = {
+    summary: "One concise sentence containing only key information.",
+    facts: ["Atomic key fact from the input."]
+  };
+
+  return [
+    "In this ingest session, step 1 is to extract only key information from the input.",
+    "Return only strict JSON with keys summary and facts.",
+    "summary must be one concise sentence.",
+    "facts must be short atomic facts. Omit transient chatter, failed attempts without reusable meaning, and incidental wording.",
+    "Do not classify success or failure yet. Do not extract entities or relations yet.",
+    "Do not wrap the JSON in markdown.",
+    "",
+    "JSON template:",
+    JSON.stringify(template, null, 2),
+    "",
+    "Input:",
+    text
+  ].join("\n");
+}
+
+export function ingestEntitiesPrompt(keyInformation: IngestKeyInformation): string {
+  const template: ExtractedMemory = {
+    summary: "One concise sentence summarizing the key information.",
+    hasExplicitRelationOrBehaviorPath: true,
+    entities: [
+      {
+        name: "Meaningful entity name exactly as stated in the key information",
+        type: "concept",
+        aliases: [],
+        tags: [],
+        summary: "One concise sentence about this entity.",
+        confidence: 0.8
+      }
+    ],
+    relations: [
+      {
+        sourceId: "Exact source entity name from entities[].name",
+        targetId: "Exact target entity name from entities[].name",
+        predicate: "short_snake_case_predicate",
+        description: "One concise sentence explaining the explicitly confirmed relation.",
+        weight: 1,
+        confidence: 0.8,
+        evidenceIds: []
+      }
+    ]
+  };
+
+  return [
+    "Continue the same ingest session. Step 2 is entity and relation extraction from the key information only.",
+    "Return only strict JSON with keys summary, hasExplicitRelationOrBehaviorPath, entities, relations.",
+    "Strictly decide whether the key information contains meaningful, durable entities with practical value.",
+    "If there are no meaningful entities, return [] for entities and relations.",
+    "Only extract relationships that the user explicitly confirmed, or behavior paths that the user explicitly described.",
+    "Set hasExplicitRelationOrBehaviorPath to true only when there is at least one explicitly confirmed relation or explicitly described behavior path.",
+    "Do not infer weak relations from co-occurrence. Do not classify success or failure yet.",
+    "Do not wrap the JSON in markdown.",
+    "",
+    "JSON template:",
+    JSON.stringify(template, null, 2),
+    "",
+    "Key information:",
+    JSON.stringify(keyInformation, null, 2)
+  ].join("\n");
+}
+
+export function ingestOutcomePrompt(input: { keyInformation: IngestKeyInformation; extraction: ExtractedMemory }): string {
+  const template: ExtractedMemory = {
+    experienceOutcome: "success",
+    summary: "One concise sentence summarizing the key information.",
+    successExperience: "Public reusable successful behavior path without specific entity names.",
+    hasExplicitRelationOrBehaviorPath: true,
+    entities: [],
+    relations: []
+  };
+
+  return [
+    "Continue the same ingest session. Step 3 is outcome classification and success-experience extraction.",
+    "Return only strict JSON with keys experienceOutcome, summary, successExperience, hasExplicitRelationOrBehaviorPath, entities, relations.",
+    "Decide whether the key information is essentially successful behavior, failed behavior, or unknown.",
+    "experienceOutcome must be one of success, failure, unknown.",
+    "If the outcome is failure or unknown, successExperience must be an empty string.",
+    "If the outcome is success, successExperience must be a public, reusable behavior path or practice.",
+    "successExperience must not contain specific entity names, aliases, private codenames, project names, table names, API names, file names, user names, or one-off identifiers.",
+    "Preserve the entities and relations from step 2 unless they clearly violate the rules.",
+    "Do not wrap the JSON in markdown.",
+    "",
+    "JSON template:",
+    JSON.stringify(template, null, 2),
+    "",
+    "Key information:",
+    JSON.stringify(input.keyInformation, null, 2),
+    "",
+    "Step 2 extraction:",
+    JSON.stringify(input.extraction, null, 2)
+  ].join("\n");
+}
+
+export function ingestReviewPrompt(input: { extraction: ExtractedMemory; candidates: MemoryMatch[] }): string {
+  const template: IngestReviewDecision = {
+    action: "store",
+    reason: "Short reason.",
+    replaceEntityIds: [],
+    replaceRelationIds: [],
+    successExperience: "Optional improved public reusable lesson."
+  };
+
+  return [
+    "Review a proposed memory ingest against existing memory candidates and return only strict JSON.",
+    "Use exactly this top-level shape: action, reason, replaceEntityIds, replaceRelationIds, successExperience.",
+    "action must be one of store, skip, replace.",
+    "Use skip when the proposed memory is a duplicate or highly similar to existing memory and adds no meaningful improvement.",
+    "Use replace when the proposed memory improves, corrects, or generalizes existing memory. Include only existing candidate IDs that should be replaced.",
+    "Use store when it is meaningfully new.",
+    "successExperience must remain public and reusable. It must not contain specific entity names, aliases, private codenames, project names, table names, API names, file names, user names, or one-off identifiers.",
+    "Do not invent IDs. replaceEntityIds may contain only candidate IDs whose kind is entity. replaceRelationIds may contain only candidate IDs whose kind is relation.",
+    "Do not wrap the JSON in markdown.",
+    "",
+    "JSON template:",
+    JSON.stringify(template, null, 2),
+    "",
+    "Proposed extraction:",
+    JSON.stringify(input.extraction, null, 2),
+    "",
+    "Existing candidates:",
+    JSON.stringify(input.candidates, null, 2)
   ].join("\n");
 }
 
@@ -160,11 +293,31 @@ export function parseRequiredExtraction(value: string | undefined): ExtractedMem
   if (!normalized.summary.trim()) {
     throw new Error("LLM memory extraction failed: JSON response is missing a summary.");
   }
-  if (normalized.experienceOutcome !== "failure" && normalized.entities.length === 0) {
+  if (normalized.experienceOutcome === "success" && normalized.entities.length === 0) {
     throw new Error("LLM memory extraction failed: JSON response contains no entities.");
   }
 
   return normalized;
+}
+
+export function parseRequiredIngestKeyInformation(value: string | undefined): IngestKeyInformation {
+  if (!value?.trim()) {
+    throw new Error("LLM ingest key information extraction failed: provider returned no content.");
+  }
+
+  const parsed = parseJsonObject<Partial<IngestKeyInformation>>(value);
+  if (!parsed) {
+    throw new Error("LLM ingest key information extraction failed: provider did not return valid JSON.");
+  }
+
+  const keyInformation = {
+    summary: textValue(parsed.summary),
+    facts: stringArray(parsed.facts)
+  };
+  if (!keyInformation.summary.trim() && keyInformation.facts.length === 0) {
+    throw new Error("LLM ingest key information extraction failed: JSON response contains no key information.");
+  }
+  return keyInformation;
 }
 
 export function parseRequiredQueryInterpretation(value: string | undefined): QueryInterpretation {
@@ -211,6 +364,28 @@ export function parseRequiredQueryHopDecision(value: string | undefined): QueryH
   };
 }
 
+export function parseRequiredIngestReviewDecision(value: string | undefined, candidates: MemoryMatch[]): IngestReviewDecision {
+  if (!value?.trim()) {
+    throw new Error("LLM ingest review failed: provider returned no content.");
+  }
+
+  const parsed = parseJsonObject<Partial<IngestReviewDecision>>(value);
+  if (!parsed) {
+    throw new Error("LLM ingest review failed: provider did not return valid JSON.");
+  }
+
+  const candidateEntityIds = new Set(candidates.filter((candidate) => candidate.kind === "entity").map((candidate) => candidate.id));
+  const candidateRelationIds = new Set(candidates.filter((candidate) => candidate.kind === "relation").map((candidate) => candidate.id));
+  const action = parsed.action === "skip" || parsed.action === "replace" ? parsed.action : "store";
+  return {
+    action,
+    reason: optionalTextValue(parsed.reason),
+    replaceEntityIds: stringArray(parsed.replaceEntityIds).filter((id) => candidateEntityIds.has(id)),
+    replaceRelationIds: stringArray(parsed.replaceRelationIds).filter((id) => candidateRelationIds.has(id)),
+    successExperience: optionalTextValue(parsed.successExperience)
+  };
+}
+
 export function normalizeExtraction(extraction: ExtractedMemory): ExtractedMemory {
   const entities = Array.isArray(extraction.entities) ? extraction.entities : [];
   const relations = Array.isArray(extraction.relations) ? extraction.relations : [];
@@ -218,6 +393,8 @@ export function normalizeExtraction(extraction: ExtractedMemory): ExtractedMemor
   return {
     experienceOutcome: experienceOutcomeValue(extraction.experienceOutcome),
     summary: textValue(extraction.summary),
+    successExperience: optionalTextValue(extraction.successExperience),
+    hasExplicitRelationOrBehaviorPath: Boolean(extraction.hasExplicitRelationOrBehaviorPath),
     entities: entities
       .map((entity) => ({
         name: textValue(entity.name),

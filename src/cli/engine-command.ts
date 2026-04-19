@@ -343,8 +343,11 @@ function formatMatchSummary(matches: Awaited<ReturnType<MemoryEngine["query"]>>[
 }
 
 function ingestMessage(result: IngestResult): string {
+  if (result.meta.skipped) {
+    return `Skipped memory ingest${result.meta.reason ? `: ${result.meta.reason}` : "."}`;
+  }
   if (result.meta.duplicate) {
-    return "Skipped duplicate memory; existing episode was reused.";
+    return result.episode.filePath ? "Skipped duplicate memory; existing episode was reused." : "Skipped duplicate or highly similar memory; nothing was stored.";
   }
   if (result.meta.merged) {
     return `Enhanced existing memory: ${result.meta.entitiesMerged} entities merged, ${result.meta.relationsMerged} relations merged, and 1 episode recorded.`;
