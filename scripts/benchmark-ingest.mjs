@@ -5,50 +5,29 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { MemoryEngine } from "../dist/src/index.js";
 
-const count = Number(process.argv[2] ?? 1000);
-const duplicateEvery = Number(process.argv[3] ?? 10);
+const count = Number(process.argv[2] ?? 100);
 
 class BenchmarkProvider {
-  async extractMemory({ text }) {
-    const projectNumber = text.match(/Project (\d+)/)?.[1] ?? "0";
-    const projectName = `Project ${projectNumber}`;
+  async planWikiUpdates({ raw }) {
+    const projectNumber = raw.text.match(/Project (\d+)/)?.[1] ?? "0";
+    const title = `Project ${projectNumber}`;
     return {
-      summary: `${projectName} uses Obsidian memory`,
-      entities: [
+      pages: [
         {
-          name: projectName,
+          title,
           type: "project",
-          summary: `${projectName} stores local agent memory.`,
-          aliases: [`P${projectNumber}`],
+          summary: `${title} uses Obsidian memory.`,
           tags: ["benchmark"],
-          confidence: 0.9
-        },
-        {
-          name: "Obsidian",
-          type: "artifact",
-          summary: "Obsidian stores Markdown vault notes.",
-          aliases: [],
-          tags: ["tool"],
-          confidence: 0.9
-        }
-      ],
-      relations: [
-        {
-          sourceId: projectName,
-          targetId: "Obsidian",
-          predicate: "uses",
-          description: `${projectName} uses Obsidian for memory.`,
-          confidence: 0.9
+          aliases: [`P${projectNumber}`],
+          links: ["Obsidian"],
+          sourceIds: [raw.id],
+          body: [`# ${title}`, "", `${title} uses [[Obsidian]] for local agent memory.`, "", "## Sources", `- ${raw.id}`].join("\n")
         }
       ]
     };
   }
 
-  async extractQuery() {
-    throw new Error("unused");
-  }
-
-  async synthesizeAnswer() {
+  async synthesizeWikiAnswer() {
     throw new Error("unused");
   }
 }
@@ -59,29 +38,20 @@ const engine = await MemoryEngine.create({ vaultPath, modelProvider: new Benchma
 try {
   await engine.init();
   const startedAt = performance.now();
-  const statuses = new Map();
 
   for (let index = 0; index < count; index += 1) {
-    const projectNumber = duplicateEvery > 0 && index % duplicateEvery === 0 ? 0 : index;
-    const result = await engine.ingest({ text: `Project ${projectNumber} uses Obsidian for memory.` });
-    statuses.set(result.meta.status, (statuses.get(result.meta.status) ?? 0) + 1);
+    await engine.ingest({ text: `Project ${index} uses Obsidian for memory.` });
   }
 
   const durationMs = performance.now() - startedAt;
-  const snapshot = await engine.export();
+  const status = await engine.status();
   console.log(
     JSON.stringify(
       {
         count,
-        duplicateEvery,
         durationMs: Number(durationMs.toFixed(2)),
         averageMs: Number((durationMs / count).toFixed(3)),
-        statuses: Object.fromEntries(statuses),
-        finalCounts: {
-          entities: snapshot.entities.length,
-          relations: snapshot.relations.length,
-          episodes: snapshot.episodes.length
-        }
+        finalCounts: status.counts
       },
       null,
       2

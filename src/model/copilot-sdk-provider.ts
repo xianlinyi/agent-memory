@@ -1,26 +1,10 @@
-import { mkdir, appendFile } from "node:fs/promises";
+import { appendFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { approveAll, CopilotClient } from "@github/copilot-sdk";
 import type { CopilotClientOptions, CopilotSession, SessionConfig } from "@github/copilot-sdk";
-import type { ExtractedMemory, IngestKeyInformation, IngestReviewDecision, MemoryMatch, QueryHopCandidate, QueryHopDecision, QueryInterpretation } from "../types.js";
-import {
-  answerPrompt,
-  compactPrompt,
-  extractionPrompt,
-  ingestEntitiesPrompt,
-  ingestKeyInformationPrompt,
-  ingestOutcomePrompt,
-  ingestReviewPrompt,
-  parseRequiredIngestKeyInformation,
-  parseRequiredIngestReviewDecision,
-  parseRequiredExtraction,
-  parseRequiredQueryHopDecision,
-  parseRequiredQueryInterpretation,
-  queryHopPrompt,
-  queryPrompt
-} from "./extraction.js";
+import type { RawDocument, WikiLintIssue, WikiPage, WikiSchema, WikiSearchResult, WikiUpdatePlan } from "../types.js";
+import { parseRequiredWikiLintIssues, parseRequiredWikiUpdatePlan, wikiAnswerPrompt, wikiLintPrompt, wikiUpdatePlanPrompt } from "./extraction.js";
 import type { ModelProvider } from "./model-provider.js";
-import type { IngestModelSession } from "./model-provider.js";
 
 export interface CopilotSdkModelProviderOptions {
   model?: string;
@@ -44,94 +28,20 @@ export class CopilotSdkModelProvider implements ModelProvider {
     validateOptions(options);
   }
 
-  async extractMemory(input: { text: string }): Promise<ExtractedMemory> {
-    const output = await this.send(extractionPrompt(input.text));
-    return parseRequiredExtraction(output);
+  async planWikiUpdates(input: { raw: RawDocument; existingPages: WikiPage[]; schema: WikiSchema }): Promise<WikiUpdatePlan> {
+    const output = await this.send(wikiUpdatePlanPrompt(input));
+    return parseRequiredWikiUpdatePlan(output, input.raw.id);
   }
 
-  async startIngestSession(): Promise<IngestModelSession> {
-    const client = await this.getClient();
-    const session = await client.createSession(this.sessionConfig());
-    const trace = this.createTrace(session);
-    const unsubscribe = session.on((event) => {
-      void trace.write("event", { eventType: event.type, event });
-    });
-    await trace.write("session.created", {
-      sessionId: session.sessionId,
-      workspacePath: session.workspacePath,
-      model: this.options.model,
-      reasoningEffort: this.options.reasoningEffort,
-      configDir: this.options.configDir,
-      cwd: this.options.cwd,
-      purpose: "ingest"
-    });
-
-    const run = async (prompt: string) => {
-      try {
-        await trace.write("prompt", { prompt });
-        const response = await session.sendAndWait({ prompt }, this.options.timeoutMs);
-        const output = response?.data.content?.trim();
-        await trace.write("response", { output, response });
-        return output;
-      } catch (error) {
-        await trace.write("error", { message: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack : undefined });
-        throw new Error(`LLM provider call failed: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    };
-
-    return {
-      extractKeyInformation: async (input: { text: string }): Promise<IngestKeyInformation> => parseRequiredIngestKeyInformation(await run(ingestKeyInformationPrompt(input.text))),
-      extractEntitiesAndRelations: async (input: { keyInformation: IngestKeyInformation }): Promise<ExtractedMemory> =>
-        parseRequiredExtraction(await run(ingestEntitiesPrompt(input.keyInformation))),
-      classifyOutcomeAndExtractSuccess: async (input: { keyInformation: IngestKeyInformation; extraction: ExtractedMemory }): Promise<ExtractedMemory> =>
-        parseRequiredExtraction(await run(ingestOutcomePrompt(input))),
-      reviewIngestMemory: async (input: { extraction: ExtractedMemory; candidates: MemoryMatch[] }): Promise<IngestReviewDecision> =>
-        parseRequiredIngestReviewDecision(await run(ingestReviewPrompt(input)), input.candidates),
-      close: async () => {
-        unsubscribe();
-        await session.disconnect().catch((error) => trace.write("disconnect.error", { message: error instanceof Error ? error.message : String(error) }));
-        await trace.write("session.disconnected", { sessionId: session.sessionId });
-      }
-    };
-  }
-
-  async reviewIngestMemory(input: { extraction: ExtractedMemory; candidates: MemoryMatch[] }): Promise<IngestReviewDecision> {
-    const output = await this.send(ingestReviewPrompt(input));
-    return parseRequiredIngestReviewDecision(output, input.candidates);
-  }
-
-  async extractQuery(input: { text: string }): Promise<QueryInterpretation> {
-    const output = await this.send(queryPrompt(input.text));
-    return parseRequiredQueryInterpretation(output);
-  }
-
-  async decideQueryHop(input: {
-    query: string;
-    interpretation: QueryInterpretation;
-    hop: number;
-    maxHops: number;
-    matches: MemoryMatch[];
-    candidates: QueryHopCandidate[];
-    visitedNodeIds: string[];
-  }): Promise<QueryHopDecision> {
-    const output = await this.send(queryHopPrompt(input));
-    return parseRequiredQueryHopDecision(output);
-  }
-
-  async synthesizeAnswer(input: { query: string; interpretation: QueryInterpretation; matches: MemoryMatch[] }): Promise<string> {
-    const output = await this.send(answerPrompt(input.query, input.interpretation, input.matches));
-    if (!output?.trim()) {
-      throw new Error("LLM answer synthesis failed: provider returned no content.");
-    }
+  async synthesizeWikiAnswer(input: { query: string; results: WikiSearchResult[]; schema: WikiSchema }): Promise<string> {
+    const output = await this.send(wikiAnswerPrompt(input));
+    if (!output?.trim()) throw new Error("LLM answer synthesis failed: provider returned no content.");
     return output.trim();
   }
 
-  async compact(input: { text: string }): Promise<string> {
-    const output = await this.send(compactPrompt(input.text));
-    if (!output?.trim()) {
-      throw new Error("LLM compaction failed: provider returned no content.");
-    }
-    return output.trim();
+  async lintWiki(input: { pages: WikiPage[]; rawDocuments: RawDocument[]; schema: WikiSchema }): Promise<WikiLintIssue[]> {
+    const output = await this.send(wikiLintPrompt(input));
+    return parseRequiredWikiLintIssues(output);
   }
 
   async doctor(input?: { modelCall?: boolean }): Promise<{ ok: boolean; message: string }> {
@@ -139,10 +49,7 @@ export class CopilotSdkModelProvider implements ModelProvider {
       const client = await this.getClient();
       const [status, auth] = await Promise.all([client.getStatus(), client.getAuthStatus()]);
       if (!auth.isAuthenticated) {
-        return {
-          ok: false,
-          message: auth.statusMessage || "Copilot SDK reached the CLI, but the user is not authenticated."
-        };
+        return { ok: false, message: auth.statusMessage || "Copilot SDK reached the CLI, but the user is not authenticated." };
       }
       if (input?.modelCall) {
         const output = await this.send("Reply with exactly: agent-memory-ok");
@@ -157,10 +64,7 @@ export class CopilotSdkModelProvider implements ModelProvider {
           : `Copilot SDK connected to CLI ${status.version}; authenticated as ${auth.login ?? auth.authType ?? "user"}.`
       };
     } catch (error) {
-      return {
-        ok: false,
-        message: error instanceof Error ? error.message : String(error)
-      };
+      return { ok: false, message: error instanceof Error ? error.message : String(error) };
     }
   }
 
@@ -237,25 +141,18 @@ export class CopilotSdkModelProvider implements ModelProvider {
 
   private sessionConfig(): SessionConfig {
     return stripUndefined({
-      clientName: "agent-memory-knowledge-graph",
+      clientName: "agent-memory-llm-wiki",
       model: this.options.model,
       reasoningEffort: this.options.reasoningEffort,
-      onPermissionRequest: approveAll,
-      configDir: this.options.configDir,
-      workingDirectory: this.options.cwd
-    });
+      tools: [],
+      mcpServers: {},
+      onPermissionRequest: approveAll
+    }) as SessionConfig;
   }
 }
 
-interface TraceRecord {
-  timestamp: string;
-  sessionId: string;
-  type: string;
-  data: unknown;
-}
-
 interface CopilotTrace {
-  write(type: string, data: unknown): Promise<void>;
+  write(event: string, payload: Record<string, unknown>): Promise<void>;
 }
 
 class NoopCopilotTrace implements CopilotTrace {
@@ -263,57 +160,22 @@ class NoopCopilotTrace implements CopilotTrace {
 }
 
 class FileCopilotTrace implements CopilotTrace {
-  private readonly filePath: string;
-  private pending: Promise<void> = Promise.resolve();
-
   constructor(
     private readonly traceDir: string,
     private readonly sessionId: string
-  ) {
-    this.filePath = join(traceDir, `${safeFileName(sessionId)}.jsonl`);
+  ) {}
+
+  async write(event: string, payload: Record<string, unknown>): Promise<void> {
+    await mkdir(this.traceDir, { recursive: true });
+    await appendFile(join(this.traceDir, `${this.sessionId}.jsonl`), `${JSON.stringify({ event, ...payload, timestamp: new Date().toISOString() })}\n`, "utf8");
   }
-
-  async write(type: string, data: unknown): Promise<void> {
-    const record: TraceRecord = {
-      timestamp: new Date().toISOString(),
-      sessionId: this.sessionId,
-      type,
-      data: normalizeTraceData(data)
-    };
-    const line = `${JSON.stringify(record)}\n`;
-    this.pending = this.pending
-      .then(async () => {
-        await mkdir(this.traceDir, { recursive: true });
-        await appendFile(this.filePath, line, "utf8");
-      })
-      .catch(() => undefined);
-    await this.pending;
-  }
-}
-
-function safeFileName(value: string): string {
-  return value.replace(/[^a-zA-Z0-9._-]/g, "_") || "session";
-}
-
-function normalizeTraceData(value: unknown): unknown {
-  return JSON.parse(
-    JSON.stringify(value, (_key, item) => {
-      if (typeof item === "bigint") return item.toString();
-      if (item instanceof Error) return { message: item.message, stack: item.stack };
-      return item;
-    })
-  ) as unknown;
-}
-
-function stripUndefined<T extends Record<string, unknown>>(value: T): T {
-  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as T;
 }
 
 function validateOptions(options: CopilotSdkModelProviderOptions): void {
-  if (!options.model?.trim()) {
-    throw new Error("LLM provider is not configured: model.model is required for copilot-sdk.");
-  }
-  if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
-    throw new Error("LLM provider is not configured: model.timeoutMs must be a positive number.");
-  }
+  if (!options.model?.trim()) throw new Error("LLM provider is not configured: model.model is required for copilot-sdk.");
+  if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) throw new Error("LLM provider is not configured: model.timeoutMs must be a positive number.");
+}
+
+function stripUndefined<T extends Record<string, unknown>>(value: T): Partial<T> {
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)) as Partial<T>;
 }
