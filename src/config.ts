@@ -3,9 +3,9 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { AgentMemoryConfig } from "./types.js";
 
-export const INTERNAL_DIR = ".kg";
+export const INTERNAL_DIR = ".llm-wiki";
 export const CONFIG_FILE = "config.json";
-export const DATABASE_FILE = "graph.db";
+export const DATABASE_FILE = "index.db";
 export const DEFAULT_VAULT_PATH = join(homedir(), "agent-memory", "MyVault");
 export const USER_CONFIG_FILE = process.env.AGENT_MEMORY_USER_CONFIG ?? join(homedir(), ".agent-memory", "config.json");
 export const DEFAULT_COPILOT_CONFIG_FILE = process.env.AGENT_MEMORY_COPILOT_SOURCE_CONFIG ?? join(homedir(), ".copilot", "config.json");

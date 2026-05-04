@@ -1,23 +1,7 @@
 import { spawn } from "node:child_process";
-import type { ExtractedMemory, IngestKeyInformation, IngestReviewDecision, MemoryMatch, QueryHopCandidate, QueryHopDecision, QueryInterpretation } from "../types.js";
-import {
-  answerPrompt,
-  compactPrompt,
-  extractionPrompt,
-  ingestEntitiesPrompt,
-  ingestKeyInformationPrompt,
-  ingestOutcomePrompt,
-  ingestReviewPrompt,
-  parseRequiredIngestKeyInformation,
-  parseRequiredIngestReviewDecision,
-  parseRequiredExtraction,
-  parseRequiredQueryHopDecision,
-  parseRequiredQueryInterpretation,
-  queryHopPrompt,
-  queryPrompt
-} from "./extraction.js";
+import type { RawDocument, WikiLintIssue, WikiPage, WikiSchema, WikiSearchResult, WikiUpdatePlan } from "../types.js";
+import { parseRequiredWikiLintIssues, parseRequiredWikiUpdatePlan, wikiAnswerPrompt, wikiLintPrompt, wikiUpdatePlanPrompt } from "./extraction.js";
 import type { ModelProvider } from "./model-provider.js";
-import type { IngestModelSession } from "./model-provider.js";
 
 export interface CopilotCliModelProviderOptions {
   command: string;
@@ -36,91 +20,34 @@ export class CopilotCliModelProvider implements ModelProvider {
     }
   }
 
-  async extractMemory(input: { text: string }): Promise<ExtractedMemory> {
-    const output = await this.tryRun(extractionPrompt(input.text));
-    return parseRequiredExtraction(output);
+  async planWikiUpdates(input: { raw: RawDocument; existingPages: WikiPage[]; schema: WikiSchema }): Promise<WikiUpdatePlan> {
+    const output = await this.tryRun(wikiUpdatePlanPrompt(input));
+    return parseRequiredWikiUpdatePlan(output, input.raw.id);
   }
 
-  async startIngestSession(): Promise<IngestModelSession> {
-    const transcript: Array<{ prompt: string; response: string }> = [];
-    const run = async (prompt: string) => {
-      const contextualPrompt = transcript.length === 0 ? prompt : `${formatTranscript(transcript)}\n\nNext prompt:\n${prompt}`;
-      const output = await this.tryRun(contextualPrompt);
-      transcript.push({ prompt, response: output ?? "" });
-      return output;
-    };
-
-    return {
-      extractKeyInformation: async (input: { text: string }): Promise<IngestKeyInformation> => parseRequiredIngestKeyInformation(await run(ingestKeyInformationPrompt(input.text))),
-      extractEntitiesAndRelations: async (input: { keyInformation: IngestKeyInformation }): Promise<ExtractedMemory> =>
-        parseRequiredExtraction(await run(ingestEntitiesPrompt(input.keyInformation))),
-      classifyOutcomeAndExtractSuccess: async (input: { keyInformation: IngestKeyInformation; extraction: ExtractedMemory }): Promise<ExtractedMemory> =>
-        parseRequiredExtraction(await run(ingestOutcomePrompt(input))),
-      reviewIngestMemory: async (input: { extraction: ExtractedMemory; candidates: MemoryMatch[] }): Promise<IngestReviewDecision> =>
-        parseRequiredIngestReviewDecision(await run(ingestReviewPrompt(input)), input.candidates)
-    };
-  }
-
-  async reviewIngestMemory(input: { extraction: ExtractedMemory; candidates: MemoryMatch[] }): Promise<IngestReviewDecision> {
-    const output = await this.tryRun(ingestReviewPrompt(input));
-    return parseRequiredIngestReviewDecision(output, input.candidates);
-  }
-
-  async extractQuery(input: { text: string }): Promise<QueryInterpretation> {
-    const output = await this.tryRun(queryPrompt(input.text));
-    return parseRequiredQueryInterpretation(output);
-  }
-
-  async decideQueryHop(input: {
-    query: string;
-    interpretation: QueryInterpretation;
-    hop: number;
-    maxHops: number;
-    matches: MemoryMatch[];
-    candidates: QueryHopCandidate[];
-    visitedNodeIds: string[];
-  }): Promise<QueryHopDecision> {
-    const output = await this.tryRun(queryHopPrompt(input));
-    return parseRequiredQueryHopDecision(output);
-  }
-
-  async synthesizeAnswer(input: { query: string; interpretation: QueryInterpretation; matches: MemoryMatch[] }): Promise<string> {
-    const output = await this.tryRun(answerPrompt(input.query, input.interpretation, input.matches));
-    if (!output?.trim()) {
-      throw new Error("LLM answer synthesis failed: provider returned no content.");
-    }
+  async synthesizeWikiAnswer(input: { query: string; results: WikiSearchResult[]; schema: WikiSchema }): Promise<string> {
+    const output = await this.tryRun(wikiAnswerPrompt(input));
+    if (!output?.trim()) throw new Error("LLM answer synthesis failed: provider returned no content.");
     return output.trim();
   }
 
-  async compact(input: { text: string }): Promise<string> {
-    const output = await this.tryRun(compactPrompt(input.text));
-    if (!output?.trim()) {
-      throw new Error("LLM compaction failed: provider returned no content.");
-    }
-    return output.trim();
+  async lintWiki(input: { pages: WikiPage[]; rawDocuments: RawDocument[]; schema: WikiSchema }): Promise<WikiLintIssue[]> {
+    const output = await this.tryRun(wikiLintPrompt(input));
+    return parseRequiredWikiLintIssues(output);
   }
 
   async doctor(input?: { modelCall?: boolean }): Promise<{ ok: boolean; message: string }> {
     const prompt = input?.modelCall ? "Reply with exactly: agent-memory-ok" : "Say OK if this Copilot-compatible CLI is available.";
-    let output: string | undefined;
     try {
-      output = await this.tryRun(prompt, 5000);
+      const output = await this.tryRun(prompt, 5000);
+      if (!output) return { ok: false, message: `Copilot CLI command returned no output: ${this.options.command} ${this.options.args.join(" ")}` };
+      if (input?.modelCall && !output.toLowerCase().includes("agent-memory-ok")) {
+        return { ok: false, message: `Copilot CLI responded, but model check returned unexpected output: ${output.slice(0, 120)}` };
+      }
+      return { ok: true, message: input?.modelCall ? "Copilot CLI model call succeeded." : "Copilot CLI command responded." };
     } catch (error) {
-      return {
-        ok: false,
-        message: error instanceof Error ? error.message : String(error)
-      };
+      return { ok: false, message: error instanceof Error ? error.message : String(error) };
     }
-    if (!output) {
-      return {
-        ok: false,
-        message: `Copilot CLI command returned no output: ${this.options.command} ${this.options.args.join(" ")}`
-      };
-    }
-    if (input?.modelCall && !output.toLowerCase().includes("agent-memory-ok")) {
-      return { ok: false, message: `Copilot CLI responded, but model check returned unexpected output: ${output.slice(0, 120)}` };
-    }
-    return { ok: true, message: input?.modelCall ? "Copilot CLI model call succeeded." : "Copilot CLI command responded." };
   }
 
   private async tryRun(prompt: string, timeoutMs = this.options.timeoutMs): Promise<string | undefined> {
@@ -130,13 +57,6 @@ export class CopilotCliModelProvider implements ModelProvider {
       throw new Error(`LLM provider call failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-}
-
-function formatTranscript(transcript: Array<{ prompt: string; response: string }>): string {
-  return [
-    "Previous messages in this ingest session:",
-    ...transcript.flatMap((item, index) => [`Prompt ${index + 1}:`, item.prompt, `Response ${index + 1}:`, item.response])
-  ].join("\n");
 }
 
 function runCommand(command: string, args: string[], prompt: string, promptInput: "stdin" | "argument" | undefined, timeoutMs: number): Promise<string> {
@@ -173,12 +93,8 @@ function runCommand(command: string, args: string[], prompt: string, promptInput
 }
 
 function resolvePromptArgs(args: string[], prompt: string, promptInput: "stdin" | "argument" | undefined): string[] {
-  if (args.some((arg) => arg.includes("{prompt}"))) {
-    return args.map((arg) => arg.replaceAll("{prompt}", prompt));
-  }
-  if (promptInput === "argument") {
-    return [...args, prompt];
-  }
+  if (args.some((arg) => arg.includes("{prompt}"))) return args.map((arg) => arg.replaceAll("{prompt}", prompt));
+  if (promptInput === "argument") return [...args, prompt];
   return args;
 }
 

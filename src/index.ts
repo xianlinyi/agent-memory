@@ -1,5 +1,6 @@
 export { MemoryEngine, createDefaultEngine, textOrFile } from "./core/memory-engine.js";
 export type { MemoryEngineOptions } from "./core/memory-engine.js";
+export { configPath, defaultConfig, defaultVaultPath, loadConfig, writeConfig } from "./config.js";
 export { MemoryEngineExecutor } from "./core/engine-executor.js";
 export type { MemoryEngineExecutorOptions } from "./core/engine-executor.js";
 export { createModelProvider } from "./model/model-factory.js";
@@ -8,12 +9,7 @@ export type { CopilotSdkModelProviderOptions } from "./model/copilot-sdk-provide
 export { CopilotCliModelProvider } from "./model/copilot-cli-provider.js";
 export type { CopilotCliModelProviderOptions } from "./model/copilot-cli-provider.js";
 export type { IngestModelSession, ModelProvider } from "./model/model-provider.js";
-export type { GraphStore } from "./store/graph-store.js";
-export { NodeSqliteFtsGraphStore } from "./store/node-sqlite-fts-store.js";
-export { NoopEmbeddingProvider } from "./store/embedding.js";
-export type { EmbeddingProvider } from "./store/embedding.js";
-export { NoopVectorStore } from "./store/vector-store.js";
-export type { VectorStore } from "./store/vector-store.js";
-export { ObsidianVaultStore } from "./vault/vault-store.js";
+export { WikiIndexStore } from "./store/wiki-index-store.js";
+export { LlmWikiVaultStore, ObsidianVaultStore } from "./vault/vault-store.js";
 export type { VaultStore } from "./vault/vault-store.js";
 export * from "./types.js";

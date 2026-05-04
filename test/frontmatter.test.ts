@@ -42,3 +42,68 @@ test("frontmatter roundtrip preserves session source metadata", () => {
   assert.equal(parsed.frontmatter.source_uri, "memory://planning");
   assert.deepEqual(parsed.frontmatter.entity_ids, ["entity:project-atlas"]);
 });
+
+test("frontmatter roundtrip preserves entity routing metadata", () => {
+  const markdown = stringifyMarkdownDocument({
+    frontmatter: {
+      id: "page:payment-team",
+      type: "capability",
+      canonical: "Payment Team",
+      aliases: ["payment"],
+      hints: ["owner", "oncall"],
+      entrypoints: ["pagerduty", "slack://payments-oncall"]
+    },
+    body: "# Payment Team\n\nEscalation path for payment incidents."
+  });
+
+  const parsed = parseMarkdownDocument(markdown);
+  assert.equal(parsed.frontmatter.canonical, "Payment Team");
+  assert.deepEqual(parsed.frontmatter.hints, ["owner", "oncall"]);
+  assert.deepEqual(parsed.frontmatter.entrypoints, ["pagerduty", "slack://payments-oncall"]);
+});
+
+test("frontmatter roundtrip preserves memory staging metadata", () => {
+  const markdown = stringifyMarkdownDocument({
+    frontmatter: {
+      id: "raw:incident-1",
+      memory_class: "episodic",
+      memory_stage: "candidate",
+      session_id: "session-123",
+      event_time: "2026-05-03T08:30:00.000Z",
+      importance: 0.9,
+      confidence: 0.7,
+      supersedes: ["raw:incident-0"]
+    },
+    body: "# Raw Document\n\nPayment proof failed because MQ timed out."
+  });
+
+  const parsed = parseMarkdownDocument(markdown);
+  assert.equal(parsed.frontmatter.memory_class, "episodic");
+  assert.equal(parsed.frontmatter.memory_stage, "candidate");
+  assert.equal(parsed.frontmatter.session_id, "session-123");
+  assert.equal(parsed.frontmatter.event_time, "2026-05-03T08:30:00.000Z");
+  assert.equal(parsed.frontmatter.importance, 0.9);
+  assert.equal(parsed.frontmatter.confidence, 0.7);
+  assert.deepEqual(parsed.frontmatter.supersedes, ["raw:incident-0"]);
+});
+
+test("frontmatter roundtrip preserves wiki update candidate metadata", () => {
+  const markdown = stringifyMarkdownDocument({
+    frontmatter: {
+      id: "page:update-payment-proof",
+      memory_stage: "wiki_update_candidate",
+      review_status: "pending",
+      wiki_target_title: "Payment Proof",
+      wiki_target_path: "wiki/semantic/payment-proof.md",
+      approved_at: "2026-05-03T12:00:00.000Z"
+    },
+    body: "# Payment Proof\n\nProposed wiki content."
+  });
+
+  const parsed = parseMarkdownDocument(markdown);
+  assert.equal(parsed.frontmatter.memory_stage, "wiki_update_candidate");
+  assert.equal(parsed.frontmatter.review_status, "pending");
+  assert.equal(parsed.frontmatter.wiki_target_title, "Payment Proof");
+  assert.equal(parsed.frontmatter.wiki_target_path, "wiki/semantic/payment-proof.md");
+  assert.equal(parsed.frontmatter.approved_at, "2026-05-03T12:00:00.000Z");
+});

@@ -1,175 +1,141 @@
 export type ISODateString = string;
+export type MemoryClass = "episodic" | "semantic" | "procedural";
+export type MemoryStage = "raw" | "session_summary" | "candidate" | "long_term" | "wiki_update_candidate" | "consolidated";
+export type ReviewStatus = "pending" | "approved" | "rejected";
+export type RawTargetScope = "memory" | "wiki";
 
-export type EntityType =
-  | "concept"
-  | "person"
-  | "project"
-  | "bug"
-  | "rule"
-  | "artifact"
-  | "decision"
-  | "topic"
-  | "unknown";
-
-export interface Entity {
-  id: string;
-  name: string;
-  type: EntityType;
-  summary?: string;
-  aliases: string[];
-  tags: string[];
-  confidence: number;
-  createdAt: ISODateString;
-  updatedAt: ISODateString;
-  externalRefs?: Record<string, string>;
-  filePath?: string;
+export interface MemoryMetadata {
+  memoryClass?: MemoryClass;
+  memoryStage?: MemoryStage;
+  sessionId?: string;
+  eventTime?: ISODateString;
+  importance?: number;
+  confidence?: number;
+  supersedes?: string[];
 }
 
-export interface Relation {
-  id: string;
-  sourceId: string;
-  targetId: string;
-  predicate: string;
-  description?: string;
-  weight: number;
-  confidence: number;
-  evidenceIds: string[];
-  createdAt: ISODateString;
-  updatedAt: ISODateString;
-  filePath?: string;
-}
+export type RawDocumentKind = "cli" | "file" | "url" | "message" | "import" | "manual";
 
-export interface Episode {
+export interface RawDocument extends MemoryMetadata {
   id: string;
-  title: string;
-  text: string;
-  summary?: string;
-  sourceId?: string;
-  entityIds: string[];
-  createdAt: ISODateString;
-  updatedAt: ISODateString;
-  filePath?: string;
-}
-
-export interface SourceRef {
-  id: string;
-  kind: "cli" | "file" | "url" | "message" | "import" | "manual";
+  path: string;
+  targetScope?: RawTargetScope;
+  kind: RawDocumentKind;
   label: string;
   uri?: string;
-  text?: string;
+  contentHash: string;
+  createdAt: ISODateString;
+  text: string;
+}
+
+export interface WikiPage extends MemoryMetadata {
+  id: string;
+  path: string;
+  title: string;
+  type: string;
+  canonical?: string;
+  summary: string;
+  tags: string[];
+  aliases: string[];
+  hints: string[];
+  entrypoints: string[];
+  links: string[];
+  sourceIds: string[];
+  reviewStatus?: ReviewStatus;
+  wikiTargetTitle?: string;
+  wikiTargetPath?: string;
+  approvedAt?: ISODateString;
+  body: string;
   createdAt: ISODateString;
   updatedAt: ISODateString;
-  filePath?: string;
 }
 
-export interface ExtractedMemory {
-  experienceOutcome?: "success" | "failure" | "unknown";
-  summary: string;
-  successExperience?: string;
-  hasExplicitRelationOrBehaviorPath?: boolean;
-  hasExplicitConceptSpecification?: boolean;
-  entities: Array<Partial<Entity> & Pick<Entity, "name">>;
-  relations: Array<Pick<Relation, "sourceId" | "targetId" | "predicate"> & Partial<Relation>>;
+export interface WikiSchema {
+  pageTypes: string;
+  styleGuide: string;
+  lintRules: string;
 }
 
-export interface IngestKeyInformation {
-  summary: string;
-  facts: string[];
-}
-
-export interface QueryInterpretation {
-  keywords: string[];
-  entities: string[];
-  predicates: string[];
-  expandedQuery: string;
-}
-
-export interface QueryHopCandidate {
-  id: string;
+export interface WikiPageDraft {
+  path?: string;
   title: string;
+  type?: string;
+  canonical?: string;
   summary?: string;
+  tags?: string[];
+  aliases?: string[];
+  hints?: string[];
+  entrypoints?: string[];
+  links?: string[];
+  sourceIds?: string[];
+  reviewStatus?: ReviewStatus;
+  wikiTargetTitle?: string;
+  wikiTargetPath?: string;
+  approvedAt?: ISODateString;
+  memoryClass?: MemoryClass;
+  memoryStage?: MemoryStage;
+  sessionId?: string;
+  eventTime?: ISODateString;
+  importance?: number;
+  confidence?: number;
+  supersedes?: string[];
+  body: string;
 }
 
-export interface QueryHopDecision {
-  continue: boolean;
-  nodeIds: string[];
-  reason?: string;
+export interface WikiUpdatePlan {
+  pages: WikiPageDraft[];
+  merge?: Array<{ fromTitle: string; toTitle: string; reason?: string }>;
+  notes?: string[];
 }
 
-export interface QueryTraversalStep {
-  hop: number;
-  fromNodeIds: string[];
-  selectedNodeIds: string[];
-  addedMatchIds: string[];
-  decisionReason?: string;
-}
-
-export interface MemoryMatch {
-  kind: "entity" | "relation" | "episode" | "source";
-  id: string;
-  title: string;
-  text: string;
+export interface WikiSearchResult {
+  page: WikiPage;
   score: number;
-  metadata?: Record<string, unknown>;
+  snippet: string;
+  sources: RawDocument[];
 }
 
-export interface QueryResult {
+export interface WikiQueryResult {
   query: string;
-  interpretation: QueryInterpretation;
-  matches: MemoryMatch[];
   answer: string;
-  traversal?: QueryTraversalStep[];
+  pages: Array<{
+    id: string;
+    path: string;
+    title: string;
+    summary: string;
+    snippet: string;
+    score: number;
+  }>;
+  sources: Array<{
+    id: string;
+    path: string;
+    label: string;
+    kind: RawDocumentKind;
+    uri?: string;
+  }>;
 }
 
-export interface IngestResult {
-  source?: SourceRef;
-  episode: Episode;
-  entities: Entity[];
-  relations: Relation[];
-  meta: {
-    status: "created" | "merged" | "duplicate" | "skipped";
-    duplicate: boolean;
-    merged: boolean;
-    skipped: boolean;
-    entitiesMerged: number;
-    relationsMerged: number;
-    reason?: string;
-  };
+export interface WikiLintIssue {
+  severity: "info" | "warning" | "error";
+  code: string;
+  message: string;
+  pageId?: string;
+  sourceId?: string;
+  path?: string;
 }
 
-export interface IngestReviewDecision {
-  action: "store" | "skip" | "replace";
-  reason?: string;
-  replaceEntityIds: string[];
-  replaceRelationIds: string[];
-  successExperience?: string;
-}
-
-export interface QueryProgressEvent {
-  stage: string;
-  durationMs: number;
-  totalMs: number;
-  details?: Record<string, unknown>;
-}
-
-export interface GraphSnapshot {
-  entities: Entity[];
-  relations: Relation[];
-  episodes: Episode[];
-  sources: SourceRef[];
-}
-
-export interface MemoryStatus {
+export interface WikiStatus {
   vaultPath: string;
   databasePath: string;
-  schemaVersion: number;
   counts: {
-    entities: number;
-    relations: number;
-    episodes: number;
-    sources: number;
+    rawDocuments: number;
+    wikiPages: number;
+    memoryPages: number;
+    longMemoryPages: number;
+    wikiUpdateCandidates: number;
+    links: number;
+    sourceRefs: number;
   };
-  lastRebuildAt?: ISODateString;
   lastReindexAt?: ISODateString;
 }
 
@@ -198,27 +164,65 @@ export interface AgentMemoryConfig {
 
 export interface IngestInput {
   text: string;
+  targetScope?: RawTargetScope;
   source?: {
-    kind?: SourceRef["kind"];
+    kind?: RawDocumentKind;
     label?: string;
     uri?: string;
   };
-  onProgress?: (event: IngestProgressEvent) => void | Promise<void>;
+  memory?: {
+    class?: MemoryClass;
+    stage?: MemoryStage;
+    sessionId?: string;
+    eventTime?: ISODateString;
+    importance?: number;
+    confidence?: number;
+    supersedes?: string[];
+  };
+  deferConsolidation?: boolean;
+  onProgress?: (event: WikiProgressEvent) => void | Promise<void>;
 }
 
-export interface IngestProgressEvent {
-  stage: string;
-  durationMs: number;
-  totalMs: number;
-  input?: unknown;
-  output?: unknown;
-  details?: Record<string, unknown>;
+export interface IngestResult {
+  raw: RawDocument;
+  pages: WikiPage[];
+  plan: WikiUpdatePlan;
+}
+
+export interface ConsolidateResult {
+  sessionSummary?: WikiPage;
+  candidates: WikiPage[];
+  longMemories: WikiPage[];
+  wikiPages: WikiPage[];
+  wikiUpdateCandidates: WikiPage[];
+  pendingRawDocuments: RawDocument[];
+}
+
+export interface ApplyWikiUpdateResult {
+  candidate: WikiPage;
+  page: WikiPage;
+}
+
+export interface RejectWikiUpdateResult {
+  candidate: WikiPage;
 }
 
 export interface QueryInput {
   text: string;
   limit?: number;
-  maxHops?: number;
   synthesize?: boolean;
-  onProgress?: (event: QueryProgressEvent) => void | Promise<void>;
+  onProgress?: (event: WikiProgressEvent) => void | Promise<void>;
+}
+
+export interface WikiProgressEvent {
+  stage: string;
+  durationMs: number;
+  totalMs: number;
+  details?: Record<string, unknown>;
+}
+
+export interface DoctorCheck {
+  name: string;
+  ok: boolean;
+  message: string;
 }
