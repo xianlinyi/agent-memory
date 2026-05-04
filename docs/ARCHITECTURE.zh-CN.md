@@ -76,6 +76,6 @@ flowchart LR
 ## 开发注意事项
 
 - 项目是 ESM + TypeScript `NodeNext`。
-- Node.js 需要 `>=22.13`，因为索引层使用 `node:sqlite`。
+- Node.js 需要 `>=24.15.0`，因为索引层使用 `node:sqlite`。
 - `dist/` 是构建产物，不要手工编辑。
 - 常用验证命令：`npm run typecheck`、`npm test`。

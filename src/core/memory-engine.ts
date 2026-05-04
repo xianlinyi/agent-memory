@@ -321,7 +321,7 @@ export class MemoryEngine {
 
   async doctor(options?: { modelCall?: boolean }): Promise<DoctorCheck[]> {
     const checks: DoctorCheck[] = [
-      { name: "node", ok: isSupportedNode(), message: `Node.js ${process.version}; required >=22.13.` }
+      { name: "node", ok: isSupportedNode(), message: `Node.js ${process.version}; required >=24.15.0.` }
     ];
     try {
       await importNodeSqlite();
