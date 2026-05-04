@@ -5,22 +5,24 @@ export interface ParsedArgs {
 }
 
 export function parseArgs(args: string[]): ParsedArgs {
-  const [command, ...rest] = args;
   const flags = new Map<string, string | boolean>();
   const positionals: string[] = [];
+  let command: string | undefined;
 
-  for (let index = 0; index < rest.length; index += 1) {
-    const arg = rest[index];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
     if (arg.startsWith("--")) {
       const [rawKey, inlineValue] = arg.slice(2).split("=", 2);
       if (inlineValue !== undefined) {
         flags.set(rawKey, inlineValue);
-      } else if (rest[index + 1] && !rest[index + 1].startsWith("--")) {
-        flags.set(rawKey, rest[index + 1]);
+      } else if (args[index + 1] && !args[index + 1]?.startsWith("--")) {
+        flags.set(rawKey, args[index + 1]);
         index += 1;
       } else {
         flags.set(rawKey, true);
       }
+    } else if (!command) {
+      command = arg;
     } else {
       positionals.push(arg);
     }

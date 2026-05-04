@@ -14,6 +14,9 @@ export function createModelProvider(config: AgentMemoryConfig): ModelProvider {
     });
   }
 
+  const githubToken = resolveGithubToken(config, process.env);
+  const useLoggedInUser = config.model.useLoggedInUser ?? (githubToken ? false : undefined);
+
   return new CopilotSdkModelProvider({
     model: config.model.model,
     reasoningEffort: config.model.reasoningEffort,
@@ -24,8 +27,12 @@ export function createModelProvider(config: AgentMemoryConfig): ModelProvider {
     cwd: config.model.cwd,
     configDir: config.model.configDir,
     traceDir: config.model.traceDir ?? defaultCopilotTraceDir(config.vaultPath),
-    githubToken: config.model.githubToken,
-    useLoggedInUser: config.model.useLoggedInUser,
+    githubToken,
+    useLoggedInUser,
     logLevel: config.model.logLevel
   });
+}
+
+function resolveGithubToken(config: AgentMemoryConfig, env: NodeJS.ProcessEnv): string | undefined {
+  return config.model.githubToken?.trim() || env.AGENT_MEMORY_GITHUB_TOKEN?.trim() || env.GITHUB_TOKEN?.trim() || undefined;
 }

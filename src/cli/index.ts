@@ -15,13 +15,13 @@ async function main(): Promise<void> {
   const command = parsed.command;
   const logger = await createCliLogger({ verbose: parsed.flags.has("verbose"), logFile: stringFlag(parsed, "log-file") });
   try {
-    if (!command || command === "help" || parsed.flags.has("help")) {
-      printHelp();
+    if (command === "version" || command === "--version" || command === "-v" || parsed.flags.has("version")) {
+      await handleVersion(parsed);
       return;
     }
 
-    if (command === "version" || command === "--version" || command === "-v") {
-      await handleVersion(parsed);
+    if (!command || command === "help" || parsed.flags.has("help")) {
+      printHelp();
       return;
     }
 

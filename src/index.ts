@@ -1,5 +1,6 @@
 export { MemoryEngine, createDefaultEngine, textOrFile } from "./core/memory-engine.js";
 export type { MemoryEngineOptions } from "./core/memory-engine.js";
+export { configPath, defaultConfig, defaultVaultPath, loadConfig, writeConfig } from "./config.js";
 export { MemoryEngineExecutor } from "./core/engine-executor.js";
 export type { MemoryEngineExecutorOptions } from "./core/engine-executor.js";
 export { createModelProvider } from "./model/model-factory.js";

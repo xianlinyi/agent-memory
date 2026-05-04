@@ -1,10 +1,25 @@
 export type ISODateString = string;
+export type MemoryClass = "episodic" | "semantic" | "procedural";
+export type MemoryStage = "raw" | "session_summary" | "candidate" | "long_term" | "wiki_update_candidate" | "consolidated";
+export type ReviewStatus = "pending" | "approved" | "rejected";
+export type RawTargetScope = "memory" | "wiki";
+
+export interface MemoryMetadata {
+  memoryClass?: MemoryClass;
+  memoryStage?: MemoryStage;
+  sessionId?: string;
+  eventTime?: ISODateString;
+  importance?: number;
+  confidence?: number;
+  supersedes?: string[];
+}
 
 export type RawDocumentKind = "cli" | "file" | "url" | "message" | "import" | "manual";
 
-export interface RawDocument {
+export interface RawDocument extends MemoryMetadata {
   id: string;
   path: string;
+  targetScope?: RawTargetScope;
   kind: RawDocumentKind;
   label: string;
   uri?: string;
@@ -13,16 +28,23 @@ export interface RawDocument {
   text: string;
 }
 
-export interface WikiPage {
+export interface WikiPage extends MemoryMetadata {
   id: string;
   path: string;
   title: string;
   type: string;
+  canonical?: string;
   summary: string;
   tags: string[];
   aliases: string[];
+  hints: string[];
+  entrypoints: string[];
   links: string[];
   sourceIds: string[];
+  reviewStatus?: ReviewStatus;
+  wikiTargetTitle?: string;
+  wikiTargetPath?: string;
+  approvedAt?: ISODateString;
   body: string;
   createdAt: ISODateString;
   updatedAt: ISODateString;
@@ -35,13 +57,28 @@ export interface WikiSchema {
 }
 
 export interface WikiPageDraft {
+  path?: string;
   title: string;
   type?: string;
+  canonical?: string;
   summary?: string;
   tags?: string[];
   aliases?: string[];
+  hints?: string[];
+  entrypoints?: string[];
   links?: string[];
   sourceIds?: string[];
+  reviewStatus?: ReviewStatus;
+  wikiTargetTitle?: string;
+  wikiTargetPath?: string;
+  approvedAt?: ISODateString;
+  memoryClass?: MemoryClass;
+  memoryStage?: MemoryStage;
+  sessionId?: string;
+  eventTime?: ISODateString;
+  importance?: number;
+  confidence?: number;
+  supersedes?: string[];
   body: string;
 }
 
@@ -93,6 +130,9 @@ export interface WikiStatus {
   counts: {
     rawDocuments: number;
     wikiPages: number;
+    memoryPages: number;
+    longMemoryPages: number;
+    wikiUpdateCandidates: number;
     links: number;
     sourceRefs: number;
   };
@@ -124,11 +164,22 @@ export interface AgentMemoryConfig {
 
 export interface IngestInput {
   text: string;
+  targetScope?: RawTargetScope;
   source?: {
     kind?: RawDocumentKind;
     label?: string;
     uri?: string;
   };
+  memory?: {
+    class?: MemoryClass;
+    stage?: MemoryStage;
+    sessionId?: string;
+    eventTime?: ISODateString;
+    importance?: number;
+    confidence?: number;
+    supersedes?: string[];
+  };
+  deferConsolidation?: boolean;
   onProgress?: (event: WikiProgressEvent) => void | Promise<void>;
 }
 
@@ -136,6 +187,24 @@ export interface IngestResult {
   raw: RawDocument;
   pages: WikiPage[];
   plan: WikiUpdatePlan;
+}
+
+export interface ConsolidateResult {
+  sessionSummary?: WikiPage;
+  candidates: WikiPage[];
+  longMemories: WikiPage[];
+  wikiPages: WikiPage[];
+  wikiUpdateCandidates: WikiPage[];
+  pendingRawDocuments: RawDocument[];
+}
+
+export interface ApplyWikiUpdateResult {
+  candidate: WikiPage;
+  page: WikiPage;
+}
+
+export interface RejectWikiUpdateResult {
+  candidate: WikiPage;
 }
 
 export interface QueryInput {

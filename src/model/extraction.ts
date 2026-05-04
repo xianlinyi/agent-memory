@@ -6,9 +6,12 @@ export function wikiUpdatePlanPrompt(input: { raw: RawDocument; existingPages: W
       {
         title: "Stable page title",
         type: "concept",
+        canonical: "Canonical page name if different from title.",
         summary: "One concise summary.",
         tags: ["tag"],
         aliases: [],
+        hints: ["Short phrases that help disambiguate this page during search."],
+        entrypoints: ["Stable commands, URLs, tables, systems, or workflows that lead to this page."],
         links: ["Related Page"],
         sourceIds: [input.raw.id],
         body: "# Stable page title\n\nDurable wiki content with [[Related Page]] links.\n\n## Sources\n- raw-id"
@@ -19,11 +22,15 @@ export function wikiUpdatePlanPrompt(input: { raw: RawDocument; existingPages: W
 
   return [
     "You are maintaining a local LLM Wiki. Return only strict JSON.",
-    "Plan wiki page creations or rewrites for the new raw document.",
-    "The file system source of truth is raw/ plus wiki/. SQLite is only an index.",
+    "Plan entity page creations or rewrites for the new raw document.",
+    "The file system source of truth is memory/raw, wiki/raw, memory/long, and wiki/. SQLite is only an index.",
+    "The raw document targetScope decides whether the result belongs to memory entities or wiki entities.",
     "Every page must be durable, human-readable Markdown and must include a Sources section.",
     "Every page must cite the new raw document id when it uses information from it.",
     "Prefer updating an existing page over creating duplicates for the same topic.",
+    "Browse the existing entity pages carefully and reuse an existing entity when the raw document extends or corrects it.",
+    "Choose the most precise page type allowed by the schema and keep stable entity titles.",
+    "When a term has multiple stable meanings, prefer separate pages per meaning and use aliases, hints, and entrypoints to disambiguate them.",
     "Use [[Page Title]] wikilinks for related topics.",
     "Do not invent facts not supported by the raw document or existing pages.",
     "Return JSON with keys pages, merge, notes.",
@@ -37,15 +44,18 @@ export function wikiUpdatePlanPrompt(input: { raw: RawDocument; existingPages: W
     "Schema/style guide:",
     input.schema.styleGuide,
     "",
-    "Existing wiki pages:",
+    "Existing entity pages in target scope:",
     JSON.stringify(
       input.existingPages.map((page) => ({
         id: page.id,
         title: page.title,
         type: page.type,
+        canonical: page.canonical,
         summary: page.summary,
         tags: page.tags,
         aliases: page.aliases,
+        hints: page.hints,
+        entrypoints: page.entrypoints,
         links: page.links,
         sourceIds: page.sourceIds,
         body: page.body
@@ -125,9 +135,12 @@ export function parseRequiredWikiUpdatePlan(output: string | undefined, rawId?: 
       .map((page) => ({
         title: String(page.title),
         type: typeof page.type === "string" && page.type ? page.type : "concept",
+        canonical: typeof page.canonical === "string" && page.canonical.trim().length > 0 ? page.canonical.trim() : undefined,
         summary: typeof page.summary === "string" ? page.summary : "",
         tags: stringArray(page.tags),
         aliases: stringArray(page.aliases),
+        hints: stringArray(page.hints),
+        entrypoints: stringArray(page.entrypoints),
         links: stringArray(page.links),
         sourceIds: uniqueStrings([...stringArray(page.sourceIds), ...(rawId ? [rawId] : [])]),
         body: String(page.body)

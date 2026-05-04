@@ -1,6 +1,6 @@
 import { MemoryEngine, textOrFile } from "../index.js";
 import { configPath } from "../config.js";
-import type { IngestResult, WikiPage, RawDocument, WikiProgressEvent, WikiQueryResult } from "../types.js";
+import type { ConsolidateResult, IngestResult, RawDocument, RawTargetScope, WikiPage, WikiProgressEvent, WikiQueryResult } from "../types.js";
 import type { Logger } from "../utils/logger.js";
 import type { ParsedArgs } from "./args.js";
 import { numberFlag, stringFlag } from "./args.js";
@@ -27,6 +27,21 @@ export async function handleEngineCommand(engine: MemoryEngine, command: string,
       await logger.debug("reindexing LLM Wiki");
       await withSpinner(parsed, "Reindexing LLM Wiki", () => engine.reindex());
       printJsonOrText(parsed, { ok: true, message: "Rebuilt LLM Wiki search index." });
+      return;
+    case "consolidate":
+      await handleConsolidate(engine, parsed, logger);
+      return;
+    case "long-memory":
+      await handleLongMemory(engine, parsed);
+      return;
+    case "wiki-updates":
+      await handleWikiUpdates(engine, parsed);
+      return;
+    case "approve-wiki-update":
+      await handleApproveWikiUpdate(engine, parsed, logger);
+      return;
+    case "reject-wiki-update":
+      await handleRejectWikiUpdate(engine, parsed, logger);
       return;
     case "lint":
       await handleLint(engine, parsed);
@@ -61,10 +76,61 @@ async function handleIngest(engine: MemoryEngine, parsed: ParsedArgs, logger: Lo
         label: source ?? item.label,
         uri: item.uri
       },
+      targetScope: targetScopeFlag(parsed),
+      memory: {
+        class: memoryClassFlag(parsed),
+        sessionId: stringFlag(parsed, "session-id"),
+        eventTime: stringFlag(parsed, "event-time")
+      },
+      deferConsolidation: true,
       onProgress: async (event) => logger.debug(formatProgress(event))
     })
   );
   printJsonOrText(parsed, result, ingestMessage(result));
+}
+
+async function handleConsolidate(engine: MemoryEngine, parsed: ParsedArgs, logger: Logger): Promise<void> {
+  const result = await withSpinner(parsed, "Consolidating memory", () =>
+    engine.consolidate({
+      sessionId: stringFlag(parsed, "session-id"),
+      onProgress: async (event) => logger.debug(formatProgress(event))
+    })
+  );
+  printJsonOrText(parsed, result, consolidateMessage(result));
+}
+
+async function handleLongMemory(engine: MemoryEngine, parsed: ParsedArgs): Promise<void> {
+  const pages = await engine.longMemory({ memoryClass: memoryClassFlag(parsed) });
+  if (parsed.flags.has("json")) {
+    console.log(JSON.stringify(pages, null, 2));
+    return;
+  }
+  for (const page of pages) console.log(formatPage(page));
+}
+
+async function handleWikiUpdates(engine: MemoryEngine, parsed: ParsedArgs): Promise<void> {
+  const pages = await engine.wikiUpdateCandidates({ reviewStatus: parsed.flags.has("all") ? undefined : "pending" });
+  if (parsed.flags.has("json")) {
+    console.log(JSON.stringify(pages, null, 2));
+    return;
+  }
+  for (const page of pages) console.log(formatPage(page));
+}
+
+async function handleApproveWikiUpdate(engine: MemoryEngine, parsed: ParsedArgs, logger: Logger): Promise<void> {
+  const candidateRef = parsed.positionals.join(" ");
+  if (!candidateRef) throw new Error("approve-wiki-update requires a candidate id, title, or path.");
+  const result = await withSpinner(parsed, "Applying wiki update", () => engine.applyWikiUpdate(candidateRef));
+  await logger.debug(`approved wiki update ${result.candidate.path} -> ${result.page.path}`);
+  printJsonOrText(parsed, result, `Applied ${result.candidate.path} to ${result.page.path}.`);
+}
+
+async function handleRejectWikiUpdate(engine: MemoryEngine, parsed: ParsedArgs, logger: Logger): Promise<void> {
+  const candidateRef = parsed.positionals.join(" ");
+  if (!candidateRef) throw new Error("reject-wiki-update requires a candidate id, title, or path.");
+  const result = await withSpinner(parsed, "Rejecting wiki update", () => engine.rejectWikiUpdate(candidateRef));
+  await logger.debug(`rejected wiki update ${result.candidate.path}`);
+  printJsonOrText(parsed, result, `Rejected ${result.candidate.path}.`);
 }
 
 async function handleQuery(engine: MemoryEngine, parsed: ParsedArgs, logger: Logger): Promise<void> {
@@ -142,7 +208,15 @@ function printQuery(result: WikiQueryResult, details: boolean): void {
 }
 
 function ingestMessage(result: IngestResult): string {
+  if (result.pages.length === 0 && result.plan.notes?.includes("deferred_for_manual_consolidation")) {
+    return `Stored ${result.raw.path} for deferred consolidation.`;
+  }
   return `Compiled ${result.raw.path} into ${result.pages.length} wiki page${result.pages.length === 1 ? "" : "s"}.`;
+}
+
+function consolidateMessage(result: ConsolidateResult): string {
+  if (result.pendingRawDocuments.length === 0) return "No pending raw memories to consolidate.";
+  return `Consolidated ${result.pendingRawDocuments.length} raw item${result.pendingRawDocuments.length === 1 ? "" : "s"} into ${result.candidates.length} memory candidate${result.candidates.length === 1 ? "" : "s"}, ${result.longMemories.length} long-memory entit${result.longMemories.length === 1 ? "y" : "ies"}, and ${result.wikiPages.length} wiki entit${result.wikiPages.length === 1 ? "y" : "ies"}.`;
 }
 
 function formatPage(page: WikiPage): string {
@@ -155,4 +229,14 @@ function formatSource(source: RawDocument): string {
 
 function formatProgress(event: WikiProgressEvent): string {
   return `${event.stage} +${event.durationMs}ms total=${event.totalMs}ms${event.details ? ` ${JSON.stringify(event.details)}` : ""}`;
+}
+
+function memoryClassFlag(parsed: ParsedArgs) {
+  const value = stringFlag(parsed, "memory-class");
+  return value === "episodic" || value === "semantic" || value === "procedural" ? value : undefined;
+}
+
+function targetScopeFlag(parsed: ParsedArgs): RawTargetScope | undefined {
+  const value = stringFlag(parsed, "target");
+  return value === "memory" || value === "wiki" ? value : undefined;
 }
